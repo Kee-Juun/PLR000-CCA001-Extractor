@@ -1,0 +1,52 @@
+# Local workspace metadata
+.agents/
+.codex/
+.git/
+.git_upload/
+
+# Secrets / local config
+credentials.json
+.env
+.env.*
+*.key
+*.pem
+
+# Logs and generated output
+*.log
+outputs/
+debug/
+tmp/
+tmp_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+
+# Accidental packaged/vendor artifacts copied into the project root
+win32/
+win32com/
+*.pyd
+*.pyd.backup
+
+# Excel/user run artifacts
+~$*.xlsx
+*.xlsm
+*.bak
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

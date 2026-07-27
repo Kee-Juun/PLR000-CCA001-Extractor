@@ -1,0 +1,8 @@
+PyQt6==6.6.1
+selenium==4.15.2
+openpyxl==3.1.2
+webdriver-manager==4.0.1
+keyring==25.7.0
+pywin32==310
+beautifulsoup4==4.12.3
+

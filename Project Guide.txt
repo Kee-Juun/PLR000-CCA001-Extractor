@@ -1,0 +1,101 @@
+PREPARATION PHASE:
+
+1. Upon launch, bot will create a "PLR000-CCA001 Results" folder in the Downloads directory.
+This is where it will store the logs and output files.
+
+2. GUI will display simple and compact pyqt6 UI window with "ID" and "Password" fields vertically aligned. This will be used by the bot to log in the Lexis website later.
+
+GUI will also have a "Save Credentials" checkbox that, if selected/checked/enabled by the user, saves the users inputted "ID" and "Password" as .json file for easy retrieval in the next run.
+
+GUI will also have a "Generate" button which will automatically generate and open an excel file with 5 Columns: A - LNI, B - FILENAME, C - COURT, D - DECIDED DATE, E - LEXIS CITE.
+User will input their data in this Excel file which bot will use as mapping sheet.
+
+GUI will also have a "Extract" button which will be initially disabled---it will only be enabled after user is done inputting their ID and Password in the fields.
+
+2. After user inputs credentials, user will click the "Extract" button and bot will proceed to the Main Automation/Extraction Phase. 
+
+
+
+MAIN AUTOMATION/EXTRACTION PHASE:
+
+1. Launch Chrome browser.
+2. Navigate to Lexis website: "https://plus.lexis.com/zhome?pdmfid=1530671&crid=55227f81-2f4a-4c13-bf0a-39f3db847462"
+3. Page will load. Proceed as soon as "//*[@id="userid"]" is found.
+
+Login using user's inputted credentials.
+
+Login ID Field: //*[@id="userid"]
+Next Button: //*[@id="signInSbmtBtn"]
+
+Page will load for a bit. Proceed as soon as "//*[@id="password"]" is found.
+
+Password Input Field: //*[@id="password"]
+
+Sign In Button: //*[@id="next"]
+
+
+4. Page will load. Proceed as soon as "//*[@id="searchTerms"]" is found.
+
+Search Terms Input Field: //*[@id="searchTerms"]
+
+Input LNI data from Column A (LNI) in the Excel File with "lni=" prefix added. 
+For example: LNI data is "6HX2-9723-SFX7-C14B-00000-00", input as "lni=6HX2-9723-SFX7-C14B-00000-00".
+
+First Search Button: //*[@id="b7ttk"]/ln-searchbox/div/div/div[1]/search-button/button
+
+After inputting LNI data in the Search Terms Input Field, click the First Search Button.
+
+
+5. Page will load. Proceed as soon as "/html/body/main/div[1]/div[15]/ln-peersearch/searchresults/div/main/div[1]/div/div/div/content-type-panel/div[1]/contenttypedrawer/div/div[1]/contenttypelist/button[5]" is found.
+
+Administrative Materials Results Button: /html/body/main/div[1]/div[15]/ln-peersearch/searchresults/div/main/div[1]/div/div/div/content-type-panel/div[1]/contenttypedrawer/div/div[1]/contenttypelist/button[5]
+
+Click Administrative Materials Results Button as soon as it is found.
+
+
+6. Page will load results. Proceed as soon as "//*[@id="Private Letter Ruling 202607024, PLR 202607024, UIL: 4945.04.04"]" is found.
+
+Result Card ID: //*[@id="Private Letter Ruling 202607024, PLR 202607024, UIL: 4945.04.04"]
+
+"Private Letter Ruling 202607024, PLR 202607024, UIL: 4945.04.04" varies depending on result.
+
+If no Result Card ID is found, it means there are No Results Found. Log as "Not Available" and skip to the next LNI to process.
+
+If a Result Card ID is found, it means Result Found. Click Results Card ID.
+
+
+
+7. Page will load. Proceed as soon as "//*[@id="SS_DocumentTitle"]" is found.
+
+Lexis Cite: //*[@id="SS_DocumentTitle"]
+
+Extract text found in //*[@id="SS_DocumentTitle"] and paste to the respective row in Column E (LEXIS CITE) on the Excel file.
+This is the last step for a successful row. After successful extraction and pasting, bot is ready to process the next LNI.
+
+
+8. New Search Button: //*[@id="searchBoxZone"]/div/searchbox/button
+Click the New Search Button to open the Search Terms Input Field: //*[@id="searchTerms"]
+
+Input next LNI data from Column A (LNI) in the Excel File with "lni=" prefix added. 
+For example: LNI data is "6HX2-9723-SFX7-C142-00000-00", input as "lni=6HX2-9723-SFX7-C142-00000-00".
+
+
+After inputting LNI data with prefix, click the Second Search Button: //*[@id="6xgg"]/ln-searchbox/div/div/div[1]/search-button/button
+
+9. Repeat from Step 5 and continue to extract until all of the LNI data from Column A (LNI) in the Excel File are processed.
+
+10. After all LNIs are processed, an "Lexis Cite Extraction Succesful!" popup message will appear.
+It will then save output Excel file in the Downloads directory with filename template "PLR000-CCA001_mm-dd-yyyy_hh:mm:ss AM/PM". mm-dd-yyy for current date. hh:mm:ss AM/PM" for the current time in 12-hour format.
+
+11. Log for current run will also be saved as a .txt file with filename template "Log_PLR000-CCA001_mm-dd-yyyy_hh:mm:ss AM/PM".
+
+
+CLEANUP PHASE:
+
+1. Once run ends due to either success or error, close the browser that was used and reset the UI to be ready for the next extraction.
+
+
+ADDITIONAL FEATURES:
+
+- Progress Bar with Sheen Loading Animation, and text showing percentage of LNI processed (LNIs processed/LNI total).
+- Status Message below progress bar updating in real time showing automation actions.
