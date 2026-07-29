@@ -13,10 +13,11 @@ import traceback
 from datetime import date, timedelta
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QDate, QEvent, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
+    QCloseEvent,
     QCursor,
     QFont,
     QFontDatabase,
@@ -1051,6 +1052,89 @@ class RecipientOverridePopup(QFrame):
         super().hideEvent(event)
 
 
+class SettingsPopup(QFrame):
+    """Compact popup for less-frequently changed run settings."""
+
+    closed = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("SettingsPanel")
+        self.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if parent is not None:
+            self.setStyleSheet(parent.styleSheet())
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.shell = QFrame()
+        self.shell.setObjectName("SettingsPopupShell")
+        shell_layout = QVBoxLayout(self.shell)
+        shell_layout.setSpacing(0)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.panel = QFrame()
+        self.panel.setObjectName("SettingsPopupPanel")
+        self.panel_layout = QVBoxLayout(self.panel)
+        self.panel_layout.setSpacing(10)
+        self.panel_layout.setContentsMargins(14, 14, 14, 14)
+
+        shell_layout.addWidget(self.panel)
+        layout.addWidget(self.shell)
+
+        self.setMinimumWidth(246)
+
+    def add_widget(self, widget: QWidget) -> None:
+        """Add one settings control to the popup panel."""
+        self.panel_layout.addWidget(widget)
+
+    def add_spacing(self, amount: int) -> None:
+        """Insert a little breathing room between popup controls."""
+        self.panel_layout.addSpacing(amount)
+
+    def show_for_button(self, button: QWidget) -> None:
+        """Show the popup aligned beneath the anchor button."""
+        self.setStyleSheet(button.window().styleSheet())
+        self.adjustSize()
+
+        button_bottom_right = button.mapToGlobal(QPoint(button.width() - self.width(), button.height() + 8))
+        target_x = button_bottom_right.x()
+        target_y = button_bottom_right.y()
+
+        host_window = button.window()
+        if isinstance(host_window, QWidget):
+            host_frame = host_window.frameGeometry()
+            inset = 16
+            min_x = host_frame.left() + inset
+            max_x = host_frame.right() - self.width() - inset + 1
+            if max_x < min_x:
+                max_x = min_x
+            target_x = max(min_x, min(target_x, max_x))
+
+            min_y = host_frame.top() + inset
+            max_y = host_frame.bottom() - self.height() - inset + 1
+            preferred_above_y = button.mapToGlobal(QPoint(0, -self.height() - 8)).y()
+            if target_y > max_y:
+                target_y = preferred_above_y if preferred_above_y >= min_y else max(min_y, max_y)
+
+        self.move(QPoint(target_x, target_y))
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def hideEvent(self, event):
+        """Notify the parent when the popup closes."""
+        self.closed.emit()
+        super().hideEvent(event)
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -1061,12 +1145,14 @@ class MainWindow(QMainWindow):
         self.developer_mode_enabled = False
         self.dev_preview_compact_mode = False
         self._recipient_popup_closed_by_button = False
+        self._settings_popup_closed_by_button = False
+        self._close_requested_after_stop = False
         self.password_visible = False
         self.title_font_family = ""
         self.loading_gif_path = self._resolve_runtime_loading_asset()
         self._runtime_loading_opacity = 0.24
         self._runtime_loading_inset = 2
-        self._runtime_loading_speed = 45
+        self._runtime_loading_speed = 100
         self.runtime_loading_watermark = None
         self.runtime_loading_opacity = None
         self.runtime_loading_movie = None
@@ -1074,7 +1160,7 @@ class MainWindow(QMainWindow):
         self.header_fill_color = self._load_saved_header_fill_color()
         self.source_mode_options = (
             ("IRT Results", "irt"),
-            ("Manual Template", "manual"),
+            ("Template", "manual"),
         )
         self.developer_mode_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
         self.developer_mode_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -1085,13 +1171,9 @@ class MainWindow(QMainWindow):
         self.load_saved_credentials()
 
     def _resolve_runtime_loading_asset(self) -> Path:
-        """Pick the first lightweight runtime loading animation bundled with the app."""
+        """Return the one approved runtime loading animation for the app."""
         assets_dir = Path(__file__).resolve().parent.parent / "assets"
-        for filename in ("loading_sea.gif", "loading_falls.gif", "surface.gif"):
-            candidate = assets_dir / filename
-            if candidate.exists():
-                return candidate
-        return assets_dir / "loading_sea.gif"
+        return assets_dir / "surface.gif"
 
     def _apply_window_theme(self):
         """Apply the application stylesheet."""
@@ -1185,7 +1267,7 @@ class MainWindow(QMainWindow):
                 color: #f8fafc;
                 border: 1px solid #22304a;
                 border-radius: 12px;
-                padding: 8px 42px 8px 12px;
+                padding: 8px 40px 8px 11px;
                 font-size: 12px;
                 min-height: 20px;
             }
@@ -1558,7 +1640,7 @@ class MainWindow(QMainWindow):
                 min-height: 40px;
                 max-height: 40px;
                 border-radius: 12px;
-                padding: 0 16px;
+                padding: 0 14px;
                 font-size: 11px;
                 font-weight: 600;
                 background-color: #101722;
@@ -1577,11 +1659,43 @@ class MainWindow(QMainWindow):
                 border-color: #1f6f8b;
             }
 
+            QPushButton#SquareAccentButton {
+                min-width: 42px;
+                max-width: 42px;
+                min-height: 40px;
+                max-height: 40px;
+                border-radius: 12px;
+                padding: 0;
+                font-size: 22px;
+                font-weight: 700;
+                background-color: #112638;
+                color: #67e8f9;
+                border: 1px solid #1f6f8b;
+            }
+
+            QPushButton#SquareAccentButton:hover {
+                background-color: #163248;
+                color: #a5f3fc;
+                border-color: #22d3ee;
+            }
+
             QFrame#RecipientPanel,
             QFrame#RecipientPopupShell,
             QWidget#RecipientTabStrip {
                 background: transparent;
                 border: none;
+            }
+
+            QFrame#SettingsPanel,
+            QFrame#SettingsPopupShell {
+                background: transparent;
+                border: none;
+            }
+
+            QFrame#SettingsPopupPanel {
+                background-color: #0a1220;
+                border: 1px solid #22304a;
+                border-radius: 14px;
             }
 
             QFrame#RecipientTabPanel {
@@ -1801,8 +1915,9 @@ class MainWindow(QMainWindow):
         editor: QWidget,
         min_width: int,
         max_width: int | None = None,
+        label_alignment: Qt.AlignmentFlag = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
     ) -> QWidget:
-        """Wrap one workflow control in a centered label-plus-field column."""
+        """Wrap one workflow control in a tidy label-plus-field column."""
         container = QWidget()
         container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(container)
@@ -1811,7 +1926,7 @@ class MainWindow(QMainWindow):
 
         label = QLabel(label_text)
         label.setObjectName("FieldLabel")
-        label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        label.setAlignment(label_alignment)
         layout.addWidget(label)
 
         editor.setMinimumWidth(min_width)
@@ -1963,14 +2078,11 @@ class MainWindow(QMainWindow):
         self._update_source_mode_tooltip()
 
     def _sync_source_mode_layout(self) -> None:
-        """Show only the workflow controls that apply to the selected source mode."""
-        is_irt = self._current_source_mode() == "irt"
-
-        for widget in self.irt_workflow_fields:
-            widget.setVisible(is_irt)
-
-        for divider in self.irt_workflow_dividers:
-            divider.setVisible(is_irt)
+        """Refresh source-specific controls without reshuffling the whole form."""
+        is_manual = self._current_source_mode() == "manual"
+        if hasattr(self, "source_template_btn"):
+            self.source_template_btn.setVisible(is_manual)
+            self.source_template_btn.setEnabled(self.extraction_thread is None and is_manual)
 
     def _current_source_mode(self) -> str:
         """Return the currently selected extraction source mode."""
@@ -1988,7 +2100,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.source_mode_combo.setToolTip(
-            "Run Extraction will import rows from IRT Search Inventory using the selected court/date filters."
+            "Run Extraction will import rows from IRT Search Inventory using the selected date range across both courts."
         )
 
     def _idle_ready_detail(self) -> str:
@@ -2039,6 +2151,11 @@ class MainWindow(QMainWindow):
             return
 
         self._recipient_popup_closed_by_button = False
+        if hasattr(self, "settings_popup") and self.settings_popup.isVisible():
+            self.settings_toggle_btn.blockSignals(True)
+            self.settings_toggle_btn.setChecked(False)
+            self.settings_toggle_btn.blockSignals(False)
+            self.settings_popup.hide()
         self.recipients_toggle_btn.blockSignals(True)
         self.recipients_toggle_btn.setChecked(True)
         self.recipients_toggle_btn.blockSignals(False)
@@ -2052,6 +2169,47 @@ class MainWindow(QMainWindow):
         self.recipients_toggle_btn.blockSignals(True)
         self.recipients_toggle_btn.setChecked(False)
         self.recipients_toggle_btn.blockSignals(False)
+
+    def _settings_button_contains_cursor(self) -> bool:
+        """Return True when the cursor is inside the Settings button."""
+        local_pos = self.settings_toggle_btn.mapFromGlobal(QCursor.pos())
+        return self.settings_toggle_btn.rect().contains(local_pos)
+
+    def _toggle_settings_panel(self, _checked: bool = False) -> None:
+        """Show or hide the compact Settings popup via explicit button clicks."""
+        if self._settings_popup_closed_by_button:
+            self._settings_popup_closed_by_button = False
+            self.settings_toggle_btn.blockSignals(True)
+            self.settings_toggle_btn.setChecked(False)
+            self.settings_toggle_btn.blockSignals(False)
+            return
+
+        if self.settings_popup.isVisible():
+            self.settings_toggle_btn.blockSignals(True)
+            self.settings_toggle_btn.setChecked(False)
+            self.settings_toggle_btn.blockSignals(False)
+            self.settings_popup.hide()
+            return
+
+        self._settings_popup_closed_by_button = False
+        if hasattr(self, "recipient_popup") and self.recipient_popup.isVisible():
+            self.recipients_toggle_btn.blockSignals(True)
+            self.recipients_toggle_btn.setChecked(False)
+            self.recipients_toggle_btn.blockSignals(False)
+            self.recipient_popup.hide()
+        self.settings_toggle_btn.blockSignals(True)
+        self.settings_toggle_btn.setChecked(True)
+        self.settings_toggle_btn.blockSignals(False)
+        self.settings_popup.show_for_button(self.settings_toggle_btn)
+
+    def _on_settings_popup_closed(self) -> None:
+        """Sync the toggle button when the settings popup closes itself."""
+        self._settings_popup_closed_by_button = (
+            self.settings_toggle_btn.isDown() or self._settings_button_contains_cursor()
+        )
+        self.settings_toggle_btn.blockSignals(True)
+        self.settings_toggle_btn.setChecked(False)
+        self.settings_toggle_btn.blockSignals(False)
 
     def _apply_card_shadow(self, widget: QFrame):
         """Apply a soft drop shadow to a card."""
@@ -2112,10 +2270,12 @@ class MainWindow(QMainWindow):
         self.progress_meta_label.setText(
             "Developer mode uses the Recipients override for safe test routing."
             if enabled
-            else "IRT intake uses the selected court and date range."
+            else "IRT intake uses the selected date range across both courts."
         )
         if not enabled:
             self.recipient_popup.hide()
+            if hasattr(self, "settings_popup"):
+                self.settings_popup.hide()
 
         self.recipients_toggle_btn.setToolTip(
             (
@@ -2189,18 +2349,84 @@ class MainWindow(QMainWindow):
         painter.end()
         return QIcon(tinted)
 
+    def _begin_window_drag(self, global_pos: QPoint) -> None:
+        """Start dragging the frameless window from the given global point."""
+        self.drag_offset = global_pos - self.frameGeometry().topLeft()
+
+    def _move_window_drag(self, global_pos: QPoint) -> None:
+        """Move the frameless window using the stored drag offset."""
+        if self.drag_offset is not None:
+            self.move(global_pos - self.drag_offset)
+
+    def _end_window_drag(self) -> None:
+        """Clear any active window drag state."""
+        self.drag_offset = None
+
+    def _runtime_drag_enabled(self) -> bool:
+        """Return True when the simplified runtime panel is the active screen."""
+        return self.runtime_card.isVisible() and not self.auth_card.isVisible()
+
+    def eventFilter(self, watched, event):
+        """Allow the runtime panel itself to drag the window while buttons stay clickable."""
+        if (
+            hasattr(self, "_runtime_drag_widgets")
+            and watched in self._runtime_drag_widgets
+            and self._runtime_drag_enabled()
+        ):
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._begin_window_drag(event.globalPosition().toPoint())
+                event.accept()
+                return True
+
+            if event.type() == QEvent.Type.MouseMove and event.buttons() & Qt.MouseButton.LeftButton:
+                self._move_window_drag(event.globalPosition().toPoint())
+                event.accept()
+                return True
+
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                self._end_window_drag()
+                event.accept()
+                return True
+
+        return super().eventFilter(watched, event)
+
     def _set_runtime_panel_mode(self, show_runtime: bool):
         """Show either single-panel or full layout depending on mode."""
         if self.developer_mode_enabled and not self.dev_preview_compact_mode:
             # Keep the original full developer layout unless preview is enabled.
             self.auth_card.setVisible(True)
+            if hasattr(self, "auth_body"):
+                self.auth_body.setVisible(True)
             self.runtime_card.setVisible(True)
+            if hasattr(self, "runtime_window_controls"):
+                self.runtime_window_controls.hide()
             self._refresh_runtime_loading_watermark()
             return
 
         self.auth_card.setVisible(not show_runtime)
         self.runtime_card.setVisible(show_runtime)
+        if hasattr(self, "runtime_window_controls"):
+            self.runtime_window_controls.setVisible(show_runtime)
+            self._update_runtime_window_controls_geometry()
         self._refresh_runtime_loading_watermark()
+
+    def _update_runtime_window_controls_geometry(self) -> None:
+        """Keep the floating runtime window controls pinned in the card corner."""
+        if not hasattr(self, "runtime_window_controls"):
+            return
+
+        if not self.runtime_card.isVisible():
+            self.runtime_window_controls.hide()
+            return
+
+        controls_width = self.runtime_window_controls.sizeHint().width()
+        controls_height = self.runtime_window_controls.sizeHint().height()
+        inset_x = 16
+        inset_y = 12
+        x = max(inset_x, self.runtime_card.width() - controls_width - inset_x)
+        y = inset_y
+        self.runtime_window_controls.setGeometry(x, y, controls_width, controls_height)
+        self.runtime_window_controls.raise_()
 
     def _update_runtime_loading_watermark_geometry(self) -> None:
         """Keep the animated runtime watermark fitted behind the run-state card."""
@@ -2262,6 +2488,8 @@ class MainWindow(QMainWindow):
         self.runtime_loading_watermark.lower()
         if hasattr(self, "runtime_content") and self.runtime_content is not None:
             self.runtime_content.raise_()
+        if hasattr(self, "runtime_window_controls") and self.runtime_window_controls is not None:
+            self.runtime_window_controls.raise_()
         if self.runtime_loading_movie is not None:
             self.runtime_loading_movie.setSpeed(self._runtime_loading_speed)
             if self.runtime_loading_movie.state() == QMovie.MovieState.NotRunning:
@@ -2279,12 +2507,13 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         """Keep the runtime background animation aligned with the card bounds."""
         super().resizeEvent(event)
+        self._update_runtime_window_controls_geometry()
         self._refresh_runtime_loading_watermark()
 
     def init_ui(self):
         """Initialize the UI."""
-        self.base_window_size = (936, 456)
-        self.dev_mode_window_size = (936, 696)
+        self.base_window_size = (590, 618)
+        self.dev_mode_window_size = (590, 618)
         self.setWindowTitle("PLR000-CCA001 Extractor")
         self._update_window_size()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
@@ -2297,8 +2526,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout()
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         central_widget.setLayout(main_layout)
 
         header_card = self._create_card("HeaderCard")
@@ -2313,18 +2542,18 @@ class MainWindow(QMainWindow):
         title.setObjectName("HeroTitle")
         title.setWordWrap(False)
         title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        title.setMinimumHeight(34)
+        title.setMinimumHeight(30)
         title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         if self.title_font_family:
-            title_font = QFont(self.title_font_family, 26)
+            title_font = QFont(self.title_font_family, 22)
             title_font.setWeight(QFont.Weight.Black)
             title.setFont(title_font)
         title_bar = DraggableTitleBar()
         title_bar.setObjectName("TitleBarSurface")
         title_bar.setStyleSheet("background: transparent; border: none;")
         title_bar_layout = QHBoxLayout(title_bar)
-        title_bar_layout.setSpacing(10)
-        title_bar_layout.setContentsMargins(6, 0, 2, 0)
+        title_bar_layout.setSpacing(8)
+        title_bar_layout.setContentsMargins(4, 0, 2, 0)
 
         self.developer_mode_indicator = QLabel("DEV MODE")
         self.developer_mode_indicator.setObjectName("DeveloperPill")
@@ -2383,31 +2612,45 @@ class MainWindow(QMainWindow):
         self.auth_card = auth_card
         auth_layout = QVBoxLayout(auth_card)
         auth_layout.setSpacing(12)
-        auth_layout.setContentsMargins(18, 14, 18, 18)
+        auth_layout.setContentsMargins(16, 14, 16, 16)
         auth_layout.addWidget(title_bar)
         auth_layout.addWidget(header_separator)
 
-        credentials_grid = QGridLayout()
-        credentials_grid.setHorizontalSpacing(18)
-        credentials_grid.setVerticalSpacing(7)
+        auth_body = QWidget()
+        self.auth_body = auth_body
+        auth_body_layout = QVBoxLayout(auth_body)
+        auth_body_layout.setSpacing(12)
+        auth_body_layout.setContentsMargins(0, 0, 0, 0)
+
+        credentials_layout = QVBoxLayout()
+        credentials_layout.setSpacing(14)
 
         id_label = QLabel("Lexis ID")
         id_label.setObjectName("FieldLabel")
-        credentials_grid.addWidget(id_label, 0, 0, 1, 1)
-
         self.id_input = QLineEdit()
-        self.id_input.setPlaceholderText("ID")
-        self.id_input.setMinimumHeight(40)
+        self.id_input.setPlaceholderText("Lexis ID")
+        self.id_input.setMinimumHeight(44)
         self.id_input.textChanged.connect(self.on_credentials_changed)
-        credentials_grid.addWidget(self.id_input, 1, 0, 1, 1)
+        self.id_indicator_action = QAction(self.id_input)
+        self.id_indicator_action.setIcon(
+            self._load_colored_icon("user", "#67e8f9", 22, vertical_offset=1)
+        )
+        self.id_input.addAction(
+            self.id_indicator_action,
+            QLineEdit.ActionPosition.TrailingPosition,
+        )
+        id_block = QVBoxLayout()
+        id_block.setSpacing(6)
+        id_block.setContentsMargins(0, 0, 0, 0)
+        id_block.addWidget(id_label)
+        id_block.addWidget(self.id_input)
+        credentials_layout.addLayout(id_block)
 
         password_label = QLabel("Password")
         password_label.setObjectName("FieldLabel")
-        credentials_grid.addWidget(password_label, 0, 1, 1, 1)
-
         self.password_input = QLineEdit()
         self.password_input.setPlaceholderText("Password")
-        self.password_input.setMinimumHeight(40)
+        self.password_input.setMinimumHeight(44)
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_input.textChanged.connect(self.on_credentials_changed)
         self.password_toggle_action = QAction(self.password_input)
@@ -2417,45 +2660,30 @@ class MainWindow(QMainWindow):
             self.password_toggle_action,
             QLineEdit.ActionPosition.TrailingPosition,
         )
-        credentials_grid.addWidget(self.password_input, 1, 1, 1, 1)
+        password_block = QVBoxLayout()
+        password_block.setSpacing(6)
+        password_block.setContentsMargins(0, 0, 0, 0)
+        password_block.addWidget(password_label)
+        password_block.addWidget(self.password_input)
+        credentials_layout.addLayout(password_block)
 
-        auth_layout.addLayout(credentials_grid)
-        options_strip = QFrame()
-        options_strip.setObjectName("InlineOptionsCard")
-        options_strip.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        options_layout = QHBoxLayout(options_strip)
-        options_layout.setSpacing(12)
-        options_layout.setContentsMargins(16, 10, 16, 10)
+        auth_body_layout.addLayout(credentials_layout)
 
-        left_options_group = QWidget()
-        left_options_group.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        left_options_layout = QHBoxLayout(left_options_group)
-        left_options_layout.setContentsMargins(0, 0, 0, 0)
-        left_options_layout.setSpacing(16)
+        self.source_mode_combo = FloatingPopupComboBox()
+        self.source_mode_combo.setMinimumHeight(40)
+        self.source_mode_combo.setIconSize(QSize(24, 24))
+        self.source_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.source_mode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._configure_dropdown_combo(self.source_mode_combo, max_visible_items=5)
+        self._populate_source_mode_combo()
+        self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
 
         self.save_credentials_checkbox = QCheckBox("Remember ID")
-        left_options_layout.addWidget(self.save_credentials_checkbox)
-
         self.headless_checkbox = QCheckBox("Headless Mode")
         self.headless_checkbox.setToolTip("Run browser in background without showing the window")
         self.headless_checkbox.setChecked(True)
-        left_options_layout.addWidget(self.headless_checkbox)
-        options_layout.addStretch(1)
-        options_layout.addWidget(left_options_group, 0, Qt.AlignmentFlag.AlignVCenter)
-
-        options_layout.addSpacing(8)
-        options_layout.addWidget(self._create_workflow_divider(24), 0, Qt.AlignmentFlag.AlignVCenter)
-        options_layout.addSpacing(14)
-
-        header_color_group = QWidget()
-        header_color_group.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        header_color_layout = QHBoxLayout(header_color_group)
-        header_color_layout.setContentsMargins(0, 0, 0, 0)
-        header_color_layout.setSpacing(12)
-
-        header_color_label = QLabel("Header Color")
-        header_color_label.setObjectName("FieldLabel")
-        header_color_layout.addWidget(header_color_label)
 
         self.header_color_combo = HeaderColorComboBox()
         self.header_color_combo.setMinimumHeight(40)
@@ -2467,15 +2695,75 @@ class MainWindow(QMainWindow):
         )
         self._populate_header_color_combo()
         self.header_color_combo.currentIndexChanged.connect(self._on_header_color_changed)
-        header_color_layout.addWidget(self.header_color_combo)
-        options_layout.addWidget(header_color_group, 0, Qt.AlignmentFlag.AlignVCenter)
-        options_layout.addSpacing(26)
+
+        self.compact_preview_checkbox = QCheckBox("Preview compact runtime UX")
+        self.compact_preview_checkbox.setToolTip(
+            "When enabled in Developer Mode, only two cards are shown at once."
+        )
+        self.compact_preview_checkbox.toggled.connect(self._on_compact_preview_toggled)
+        self.compact_preview_checkbox.setVisible(False)
+
+        self.settings_popup = SettingsPopup(self)
+        self.settings_popup.closed.connect(self._on_settings_popup_closed)
+        self.settings_popup.add_widget(self.save_credentials_checkbox)
+        self.settings_popup.add_widget(self.headless_checkbox)
+
+        settings_header_color_group = QWidget()
+        settings_header_color_layout = QVBoxLayout(settings_header_color_group)
+        settings_header_color_layout.setContentsMargins(0, 0, 0, 0)
+        settings_header_color_layout.setSpacing(6)
+        settings_header_color_label = QLabel("Header Color")
+        settings_header_color_label.setObjectName("FieldLabel")
+        settings_header_color_layout.addWidget(settings_header_color_label)
+        settings_header_color_layout.addWidget(self.header_color_combo)
+        self.settings_popup.add_widget(settings_header_color_group)
+        self.settings_popup.add_widget(self.compact_preview_checkbox)
+
+        controls_frame = QFrame()
+        controls_frame.setObjectName("InlineOptionsCard")
+        controls_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        controls_outer_layout = QHBoxLayout(controls_frame)
+        controls_outer_layout.setContentsMargins(14, 12, 14, 12)
+        controls_outer_layout.setSpacing(0)
+
+        controls_inner = QWidget()
+        controls_inner.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        controls_layout = QGridLayout(controls_inner)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setHorizontalSpacing(12)
+        controls_layout.setVerticalSpacing(6)
+
+        source_label = QLabel("Source")
+        source_label.setObjectName("FieldLabel")
+        controls_layout.addWidget(source_label, 0, 0)
+
+        recipients_label = QLabel("Recipients")
+        recipients_label.setObjectName("FieldLabel")
+        controls_layout.addWidget(recipients_label, 0, 1)
+
+        source_selector_row = QWidget()
+        source_selector_layout = QHBoxLayout(source_selector_row)
+        source_selector_layout.setContentsMargins(0, 0, 0, 0)
+        source_selector_layout.setSpacing(6)
+        source_selector_layout.addWidget(self.source_mode_combo, 1)
+        self.source_mode_combo.setMinimumWidth(154)
+        self.source_mode_combo.setMaximumWidth(192)
+
+        self.source_template_btn = QPushButton("+")
+        self.source_template_btn.setObjectName("SquareAccentButton")
+        self.source_template_btn.setToolTip("Generate a manual template workbook.")
+        self.source_template_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.source_template_btn.clicked.connect(self.generate_template)
+        self.source_template_btn.hide()
+        source_selector_layout.addWidget(self.source_template_btn, 0)
+        controls_layout.addWidget(source_selector_row, 1, 0)
 
         self.recipients_toggle_btn = QPushButton("Recipients")
         self.recipients_toggle_btn.setObjectName("InlineToggleButton")
         self.recipients_toggle_btn.setCheckable(True)
         self.recipients_toggle_btn.setMinimumHeight(40)
-        self.recipients_toggle_btn.setMinimumWidth(146)
+        self.recipients_toggle_btn.setMinimumWidth(136)
+        self.recipients_toggle_btn.setMaximumWidth(146)
         self.recipients_toggle_btn.setIcon(
             self._load_colored_icon("recipients", "#cbd5e1", 24, vertical_offset=1)
         )
@@ -2484,19 +2772,34 @@ class MainWindow(QMainWindow):
             "Manually override the outgoing To and CC recipients for this run."
         )
         self.recipients_toggle_btn.clicked.connect(self._toggle_recipient_panel)
-        options_layout.addWidget(self.recipients_toggle_btn)
-        options_layout.addStretch(1)
-        auth_layout.addWidget(options_strip)
+        controls_layout.addWidget(self.recipients_toggle_btn, 1, 1)
 
-        self.source_mode_combo = FloatingPopupComboBox()
-        self.source_mode_combo.setMinimumHeight(40)
-        self.source_mode_combo.setIconSize(QSize(24, 24))
-        self.source_mode_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToContents
+        self.settings_toggle_btn = QPushButton("Settings")
+        self.settings_toggle_btn.setObjectName("InlineToggleButton")
+        self.settings_toggle_btn.setCheckable(True)
+        self.settings_toggle_btn.setMinimumHeight(54)
+        self.settings_toggle_btn.setMinimumWidth(102)
+        self.settings_toggle_btn.setMaximumWidth(108)
+        self.settings_toggle_btn.setIcon(
+            self._load_colored_icon("settings", "#67e8f9", 24, vertical_offset=1)
         )
-        self._configure_dropdown_combo(self.source_mode_combo, max_visible_items=5)
-        self._populate_source_mode_combo()
-        self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
+        self.settings_toggle_btn.setIconSize(QSize(20, 20))
+        self.settings_toggle_btn.setToolTip(
+            "Show Remember ID, Headless Mode, and Header Color settings."
+        )
+        self.settings_toggle_btn.clicked.connect(self._toggle_settings_panel)
+        controls_layout.addWidget(
+            self.settings_toggle_btn,
+            0,
+            2,
+            2,
+            1,
+            Qt.AlignmentFlag.AlignBottom,
+        )
+        controls_outer_layout.addStretch(1)
+        controls_outer_layout.addWidget(controls_inner, 0, Qt.AlignmentFlag.AlignHCenter)
+        controls_outer_layout.addStretch(1)
+        auth_body_layout.addWidget(controls_frame)
 
         self.irt_filters_frame = QFrame()
         self.irt_filters_frame.setObjectName("InlineFiltersCard")
@@ -2504,87 +2807,51 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
-        irt_filters_layout = QVBoxLayout(self.irt_filters_frame)
-        irt_filters_layout.setSpacing(0)
-        irt_filters_layout.setContentsMargins(16, 12, 16, 12)
+        irt_filters_outer_layout = QHBoxLayout(self.irt_filters_frame)
+        irt_filters_outer_layout.setSpacing(0)
+        irt_filters_outer_layout.setContentsMargins(14, 12, 14, 12)
 
-        workflow_row = QHBoxLayout()
-        workflow_row.setSpacing(12)
-        workflow_row.setContentsMargins(0, 0, 0, 0)
-        self.workflow_row_layout = workflow_row
-
-        self.source_field = self._create_workflow_field(
-            "Source",
-            self.source_mode_combo,
-            156,
-        )
-        workflow_row.addWidget(self.source_field, 1)
-
-        self.workflow_divider_1 = self._create_workflow_divider()
-        workflow_row.addWidget(self.workflow_divider_1)
-
-        self.irt_court_combo = FloatingPopupComboBox()
-        self.irt_court_combo.setMinimumHeight(40)
-        self.irt_court_combo.setIconSize(QSize(24, 24))
-        self.irt_court_combo.setMinimumContentsLength(11)
-        self.irt_court_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self._configure_dropdown_combo(self.irt_court_combo, max_visible_items=4)
-        court_icon = self._load_colored_icon("court_building", "#38bdf8", 24, vertical_offset=1)
-        self.irt_court_combo.addItem(court_icon, "Both Courts", "both")
-        self.irt_court_combo.addItem(court_icon, "FDPLR000", "FDPLR000")
-        self.irt_court_combo.addItem(court_icon, "FDCCA001", "FDCCA001")
-        self.irt_court_combo.setToolTip("Choose which IRT court code to import.")
-        self.irt_court_field = self._create_workflow_field(
-            "Court",
-            self.irt_court_combo,
-            156,
-        )
-        workflow_row.addWidget(self.irt_court_field, 1)
-
-        self.workflow_divider_2 = self._create_workflow_divider()
-        workflow_row.addWidget(self.workflow_divider_2)
+        irt_filters_inner = QWidget()
+        irt_filters_inner.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        irt_filters_layout = QHBoxLayout(irt_filters_inner)
+        irt_filters_layout.setSpacing(12)
+        irt_filters_layout.setContentsMargins(0, 0, 0, 0)
 
         self.irt_start_date_edit = QDateEdit()
         self.irt_start_date_edit.setCalendarPopup(True)
         self.irt_start_date_edit.setDisplayFormat("M/d/yyyy")
-        self.irt_start_date_edit.setMinimumHeight(38)
+        self.irt_start_date_edit.setMinimumHeight(40)
         self._decorate_date_edit(self.irt_start_date_edit)
         self.irt_start_field = self._create_workflow_field(
             "From",
             self.irt_start_date_edit,
-            154,
+            182,
+            194,
         )
-        workflow_row.addWidget(self.irt_start_field, 1)
+        irt_filters_layout.addWidget(self.irt_start_field, 1)
 
-        self.workflow_divider_3 = self._create_workflow_divider()
-        workflow_row.addWidget(self.workflow_divider_3)
+        self.workflow_divider_dates = self._create_workflow_divider()
+        irt_filters_layout.addWidget(self.workflow_divider_dates)
 
         self.irt_end_date_edit = QDateEdit()
         self.irt_end_date_edit.setCalendarPopup(True)
         self.irt_end_date_edit.setDisplayFormat("M/d/yyyy")
-        self.irt_end_date_edit.setMinimumHeight(38)
+        self.irt_end_date_edit.setMinimumHeight(40)
         self._decorate_date_edit(self.irt_end_date_edit)
         self.irt_end_field = self._create_workflow_field(
             "To",
             self.irt_end_date_edit,
-            154,
+            182,
+            194,
         )
-        workflow_row.addWidget(self.irt_end_field, 1)
+        irt_filters_layout.addWidget(self.irt_end_field, 1)
 
-        self.irt_workflow_fields = (
-            self.irt_court_field,
-            self.irt_start_field,
-            self.irt_end_field,
-        )
-        self.irt_workflow_dividers = (
-            self.workflow_divider_1,
-            self.workflow_divider_2,
-            self.workflow_divider_3,
-        )
         self._apply_default_irt_filters()
         self._sync_source_mode_layout()
-        irt_filters_layout.addLayout(workflow_row)
-        auth_layout.addWidget(self.irt_filters_frame)
+        irt_filters_outer_layout.addStretch(1)
+        irt_filters_outer_layout.addWidget(irt_filters_inner, 0, Qt.AlignmentFlag.AlignHCenter)
+        irt_filters_outer_layout.addStretch(1)
+        auth_body_layout.addWidget(self.irt_filters_frame)
 
         self.recipient_popup = RecipientOverridePopup(self)
         self.recipient_popup.closed.connect(self._on_recipient_popup_closed)
@@ -2594,40 +2861,21 @@ class MainWindow(QMainWindow):
         self.recipient_to_input.textChanged.connect(self._persist_recipient_override_settings)
         self.recipient_cc_input.textChanged.connect(self._persist_recipient_override_settings)
 
-        self.compact_preview_checkbox = QCheckBox("Preview compact runtime UX")
-        self.compact_preview_checkbox.setToolTip(
-            "When enabled in Developer Mode, only two cards are shown at once."
-        )
-        self.compact_preview_checkbox.toggled.connect(self._on_compact_preview_toggled)
-        self.compact_preview_checkbox.setVisible(False)
-        auth_layout.addWidget(self.compact_preview_checkbox)
-
         actions_divider = QFrame()
         actions_divider.setObjectName("WorkflowDivider")
         actions_divider.setFixedHeight(1)
         actions_divider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        auth_layout.addWidget(actions_divider)
+        auth_body_layout.addWidget(actions_divider)
 
         buttons_layout = QHBoxLayout()
-        buttons_layout.setSpacing(12)
+        buttons_layout.setSpacing(10)
         buttons_layout.setContentsMargins(0, 4, 0, 0)
-
-        self.generate_btn = QPushButton("Manual Template")
-        self.generate_btn.setObjectName("SecondaryButton")
-        self.generate_btn.setToolTip("Optional fallback worksheet")
-        self.generate_btn.setMinimumHeight(42)
-        self.generate_btn.setMinimumWidth(162)
-        self.generate_btn.setIcon(
-            self._load_colored_icon("template_file", "#dbe7f5", 22, vertical_offset=1)
-        )
-        self.generate_btn.setIconSize(QSize(22, 22))
-        self.generate_btn.clicked.connect(self.generate_template)
-        buttons_layout.addWidget(self.generate_btn)
 
         self.view_folder_btn = QPushButton("Open Results")
         self.view_folder_btn.setObjectName("GhostButton")
-        self.view_folder_btn.setMinimumHeight(42)
-        self.view_folder_btn.setMinimumWidth(148)
+        self.view_folder_btn.setMinimumHeight(44)
+        self.view_folder_btn.setMinimumWidth(152)
+        self.view_folder_btn.setMaximumWidth(164)
         self.view_folder_btn.setIcon(
             self._load_colored_icon("results_folder", "#9fb2ca", 22, vertical_offset=1)
         )
@@ -2640,15 +2888,16 @@ class MainWindow(QMainWindow):
         self.extract_btn = QPushButton("Run Extraction")
         self.extract_btn.setObjectName("PrimaryButton")
         self.extract_btn.setMinimumHeight(46)
-        self.extract_btn.setMinimumWidth(230)
-        self.extract_btn.setMaximumWidth(242)
+        self.extract_btn.setMinimumWidth(194)
+        self.extract_btn.setMaximumWidth(206)
         self.extract_btn.setIcon(self._load_colored_icon("play", "#ffffff", 28, vertical_offset=1))
         self.extract_btn.setIconSize(QSize(28, 28))
         self.extract_btn.setEnabled(False)
         self.extract_btn.clicked.connect(self.start_extraction)
         buttons_layout.addWidget(self.extract_btn, 0, Qt.AlignmentFlag.AlignRight)
 
-        auth_layout.addLayout(buttons_layout)
+        auth_body_layout.addLayout(buttons_layout)
+        auth_layout.addWidget(auth_body)
 
         main_layout.addWidget(auth_card)
 
@@ -2657,6 +2906,26 @@ class MainWindow(QMainWindow):
         runtime_layout = QVBoxLayout(runtime_card)
         runtime_layout.setSpacing(0)
         runtime_layout.setContentsMargins(18, 18, 18, 18)
+
+        self.runtime_window_controls = QWidget(runtime_card)
+        self.runtime_window_controls.setObjectName("RuntimeWindowControls")
+        self.runtime_window_controls.setStyleSheet("background: transparent; border: none;")
+        runtime_controls_layout = QHBoxLayout(self.runtime_window_controls)
+        runtime_controls_layout.setContentsMargins(0, 0, 0, 0)
+        runtime_controls_layout.setSpacing(8)
+
+        self.runtime_minimize_btn = QPushButton("—")
+        self.runtime_minimize_btn.setObjectName("TitleBarButton")
+        self.runtime_minimize_btn.setToolTip("Minimize")
+        self.runtime_minimize_btn.clicked.connect(self.showMinimized)
+        runtime_controls_layout.addWidget(self.runtime_minimize_btn)
+
+        self.runtime_close_btn = QPushButton("×")
+        self.runtime_close_btn.setObjectName("CloseTitleBarButton")
+        self.runtime_close_btn.setToolTip("Close")
+        self.runtime_close_btn.clicked.connect(self.close)
+        runtime_controls_layout.addWidget(self.runtime_close_btn)
+        self.runtime_window_controls.hide()
 
         runtime_content = QWidget()
         runtime_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -2676,7 +2945,7 @@ class MainWindow(QMainWindow):
         self.status_badge.setMaximumWidth(220)
         status_row.addWidget(self.status_badge, 0)
 
-        self.progress_meta_label = QLabel("IRT intake uses the selected court and date range.")
+        self.progress_meta_label = QLabel("IRT intake uses the selected date range across both courts.")
         self.progress_meta_label.setObjectName("ProgressMeta")
         self.progress_meta_label.setWordWrap(True)
         status_row.addWidget(self.progress_meta_label, 1)
@@ -2733,6 +3002,16 @@ class MainWindow(QMainWindow):
             self.runtime_loading_watermark.setMovie(self.runtime_loading_movie)
 
         self.runtime_content = runtime_content
+        self._runtime_drag_widgets = (
+            runtime_card,
+            runtime_content,
+            self.status_badge,
+            self.progress_meta_label,
+            self.progress_bar,
+            self.status_label,
+        )
+        for runtime_widget in self._runtime_drag_widgets:
+            runtime_widget.installEventFilter(self)
         runtime_layout.addStretch(1)
         runtime_layout.addWidget(runtime_content)
         runtime_layout.addStretch(1)
@@ -2798,7 +3077,7 @@ class MainWindow(QMainWindow):
                     f"File location:\n{template_path}\n\n"
                     "The file has been opened for you.\n\n"
                     "If you want Run Extraction to use this workbook,\n"
-                    "switch Source to Manual Template after you finish editing it."
+                    "switch Source to Template after you finish editing it."
                 ),
             )
 
@@ -2862,6 +3141,35 @@ class MainWindow(QMainWindow):
         )
         self.extraction_thread.request_stop()
 
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Stop an active run first, then close cleanly once progress is saved."""
+        if self.extraction_thread is None:
+            super().closeEvent(event)
+            return
+
+        if self._close_requested_after_stop:
+            event.ignore()
+            return
+
+        response = QMessageBox.question(
+            self,
+            "Stop Run And Close?",
+            (
+                "A run is still active.\n\n"
+                "Do you want to stop the run, save partial progress, and close the window once it is safe?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response == QMessageBox.StandardButton.Yes:
+            self._close_requested_after_stop = True
+            if self.stop_btn.isEnabled():
+                self.stop_extraction()
+            event.ignore()
+            return
+
+        event.ignore()
+
     def start_extraction(self):
         """Start the extraction process."""
         from utils.file_manager import FileManager
@@ -2905,9 +3213,6 @@ class MainWindow(QMainWindow):
         irt_end_date = None
 
         if source_mode == "irt":
-            irt_court_scope = str(
-                self.irt_court_combo.currentData(Qt.ItemDataRole.UserRole) or "both"
-            )
             irt_start_date = self.irt_start_date_edit.date().toPyDate()
             irt_end_date = self.irt_end_date_edit.date().toPyDate()
             if irt_start_date > irt_end_date:
@@ -2924,7 +3229,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "No Manual Workbook Found",
-                    "Please generate and fill out a Manual Template first, then close the file before running extraction.",
+                    "Please generate and fill out a Template first, then close the file before running extraction.",
                 )
                 return
 
@@ -2944,7 +3249,7 @@ class MainWindow(QMainWindow):
         logger.initialize_log_file(run_folder)
         logger.log("Extraction started")
         if source_mode == "manual":
-            logger.log(f"Source workbook will be loaded from Manual Template: {excel_path}")
+            logger.log(f"Source workbook will be loaded from Template: {excel_path}")
             if not self.developer_mode_enabled:
                 logger.log(
                     "Outlook reply context will still be resolved from the latest matching email"
@@ -2985,9 +3290,11 @@ class MainWindow(QMainWindow):
         self.source_mode_combo.setEnabled(False)
         self.irt_filters_frame.setEnabled(False)
         self.recipients_toggle_btn.setEnabled(False)
+        self.settings_toggle_btn.setEnabled(False)
         self.recipient_popup.hide()
+        self.settings_popup.hide()
         self.developer_mode_shortcut.setEnabled(False)
-        self.generate_btn.setEnabled(False)
+        self.source_template_btn.setEnabled(False)
         self.extract_btn.setEnabled(False)
         self.stop_btn.setText("Stop Run")
         self.stop_btn.setVisible(True)
@@ -3050,8 +3357,9 @@ class MainWindow(QMainWindow):
         self.source_mode_combo.setEnabled(True)
         self.irt_filters_frame.setEnabled(True)
         self.recipients_toggle_btn.setEnabled(True)
+        self.settings_toggle_btn.setEnabled(True)
         self.developer_mode_shortcut.setEnabled(True)
-        self.generate_btn.setEnabled(True)
+        self._sync_source_mode_layout()
         self.stop_btn.setEnabled(False)
         self.stop_btn.setVisible(False)
         self.stop_btn.setText("Stop Run")
@@ -3082,6 +3390,9 @@ class MainWindow(QMainWindow):
 
         self.reset_ui()
         self.extraction_thread = None
+        if self._close_requested_after_stop:
+            self._close_requested_after_stop = False
+            QTimer.singleShot(0, self.close)
 
     def extraction_cancelled(self, message: str, output_path):
         """Handle a user-requested stop without treating it like a crash."""
@@ -3094,6 +3405,9 @@ class MainWindow(QMainWindow):
         )
         self.reset_ui()
         self.extraction_thread = None
+        if self._close_requested_after_stop:
+            self._close_requested_after_stop = False
+            QTimer.singleShot(0, self.close)
 
     def open_output_file(self, output_path):
         """Open the output Excel file after the user acknowledges success."""

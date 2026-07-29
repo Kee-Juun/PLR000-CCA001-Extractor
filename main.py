@@ -27,6 +27,12 @@ def main():
     if icon_path.exists():
         window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
+    screen = window.screen() or app.primaryScreen()
+    if screen is not None:
+        available_geometry = screen.availableGeometry()
+        frame_geometry = window.frameGeometry()
+        frame_geometry.moveCenter(available_geometry.center())
+        window.move(frame_geometry.topLeft())
     
     sys.exit(app.exec())
 
