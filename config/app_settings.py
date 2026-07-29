@@ -8,6 +8,9 @@ import json
 CONFIG_DIR = Path.home() / ".plr000_cca001_extractor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HEADER_FILL_COLOR_KEY = "header_fill_color"
+RECIPIENT_OVERRIDE_TO_KEY = "recipient_override_to"
+RECIPIENT_OVERRIDE_CC_KEY = "recipient_override_cc"
+SOURCE_MODE_KEY = "source_mode"
 
 
 def load_config_data() -> dict[str, Any]:

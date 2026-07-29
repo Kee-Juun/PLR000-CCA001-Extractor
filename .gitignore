@@ -18,6 +18,9 @@ debug/
 tmp/
 tmp_*/
 
+# Oversized local animation exports
+assets/surface.gif
+
 # Python
 __pycache__/
 *.py[cod]
