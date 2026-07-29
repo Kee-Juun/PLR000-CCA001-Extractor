@@ -1096,8 +1096,8 @@ class MainWindow(QMainWindow):
     def _apply_window_theme(self):
         """Apply the application stylesheet."""
         assets_dir = Path(__file__).resolve().parent.parent / "assets"
-        chevron_icon_url = (assets_dir / "chevron_down.svg").resolve().as_uri()
-        checkmark_icon_url = (assets_dir / "checkmark.svg").resolve().as_uri()
+        chevron_icon_url = str((assets_dir / "chevron_down.png").resolve()).replace("\\", "/")
+        checkmark_icon_url = str((assets_dir / "checkmark.png").resolve()).replace("\\", "/")
         stylesheet = """
             QMainWindow {
                 background: transparent;
