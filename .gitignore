@@ -17,9 +17,18 @@ outputs/
 debug/
 tmp/
 tmp_*/
+tmp_*.png
+calendar_*fix*.png
+calendar_shell_rootcause_fix.png
 
 # Oversized local animation exports
 assets/surface.gif
+assets/launch_intro/pexels_*.mp4
+assets/launch_intro/burst_peak.png
+assets/launch_intro/drop_fall.png
+assets/launch_intro/impact_crown.png
+assets/launch_intro/liquid_frame.png
+assets/launch_intro/liquid_frame_settle.png
 
 # Python
 __pycache__/

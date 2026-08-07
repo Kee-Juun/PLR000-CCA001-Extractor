@@ -9,11 +9,13 @@ Security update:
 
 from __future__ import annotations
 
+import math
+import random
 import traceback
 from datetime import date, timedelta
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, QEvent, QPoint, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -22,18 +24,26 @@ from PyQt6.QtGui import (
     QFont,
     QFontDatabase,
     QIcon,
+    QImage,
     QKeySequence,
     QLinearGradient,
     QMovie,
     QPainter,
     QPainterPath,
+    QPen,
     QPixmap,
+    QRadialGradient,
     QRegion,
     QShortcut,
+    QTextCharFormat,
 )
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QCalendarWidget,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDateEdit,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -46,11 +56,12 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
+    QToolButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -71,6 +82,7 @@ from config.credentials import (
     load_credentials,
     save_credentials,
 )
+from utils.bubble_audio import BubblePopAudio
 
 
 class AnimatedProgressBar(QProgressBar):
@@ -119,6 +131,899 @@ class AnimatedProgressBar(QProgressBar):
                 gradient.setColorAt(1, QColor(255, 255, 255, 0))
 
                 painter.fillRect(filled_rect, gradient)
+
+
+class BubbleOverlay(QWidget):
+    """Soft drifting bubbles that animate behind the idle controls."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._bubbles: list[dict[str, object]] = []
+        self._pop_effects: list[dict[str, object]] = []
+        self._pop_audio_callback = None
+        self._held_bubble: dict[str, object] | None = None
+        self._burst_ticks_remaining = 0
+        self._cooldown_ticks_remaining = random.randint(34, 88)
+        self._quiet_ticks_remaining = random.randint(14, 30)
+        self._bubble_timer = QTimer(self)
+        self._bubble_timer.setInterval(38)
+        self._bubble_timer.timeout.connect(self._tick_bubbles)
+        self._bubble_timer.stop()
+
+    def showEvent(self, event) -> None:
+        """Animate only while the idle bubble layer is visible."""
+        if not self._bubble_timer.isActive():
+            self._bubble_timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        """Sleep the bubble animation whenever the layer is hidden."""
+        self.cancel_hold_bubble()
+        self._bubble_timer.stop()
+        super().hideEvent(event)
+
+    def set_pop_audio_callback(self, callback) -> None:
+        """Register one callback for size-aware pop audio playback."""
+        self._pop_audio_callback = callback
+
+    def _bubble_palette(self) -> tuple[QColor, ...]:
+        """Return the shared idle-water palette."""
+        return (
+            QColor("#7DD3FC"),
+            QColor("#A5F3FC"),
+            QColor("#BAE6FD"),
+            QColor("#C4B5FD"),
+            QColor("#E0F2FE"),
+        )
+
+    def _spawn_bubble(self) -> None:
+        if self.width() <= 48 or self.height() <= 48:
+            return
+
+        palette = self._bubble_palette()
+        is_micro = random.random() < 0.74
+        depth = random.uniform(0.0, 1.0)
+        if is_micro:
+            radius = random.uniform(0.9, 2.3) * (0.9 + depth * 0.18)
+            alpha = random.uniform(0.12, 0.21) * (0.84 + depth * 0.18)
+        else:
+            radius = random.uniform(5.0, 10.4) * (0.84 + depth * 0.42)
+            alpha = random.uniform(0.2, 0.31) * (0.86 + depth * 0.3)
+        spawn_y = random.uniform(self.height() * 0.985, self.height() * 1.055)
+        cluster_bias = random.random()
+        if is_micro:
+            if cluster_bias < 0.44:
+                origin_x = (self.width() * 0.5) + random.gauss(0.0, self.width() * 0.085)
+            elif cluster_bias < 0.84:
+                side = -1.0 if random.random() < 0.5 else 1.0
+                origin_x = (self.width() * 0.5) + side * random.uniform(
+                    self.width() * 0.16,
+                    self.width() * 0.34,
+                )
+            else:
+                origin_x = random.uniform(self.width() * 0.08, self.width() * 0.92)
+        elif cluster_bias < 0.7:
+            origin_x = (self.width() * 0.5) + random.gauss(0.0, self.width() * 0.07)
+        elif cluster_bias < 0.92:
+            side = -1.0 if random.random() < 0.5 else 1.0
+            origin_x = (self.width() * 0.5) + side * random.uniform(
+                self.width() * 0.14,
+                self.width() * 0.26,
+            )
+        else:
+            origin_x = random.uniform(self.width() * 0.14, self.width() * 0.86)
+        origin_x = min(self.width() * 0.88, max(self.width() * 0.12, origin_x))
+        drift_center = (origin_x - (self.width() * 0.5)) / max(1.0, self.width() * 0.5)
+        if is_micro:
+            lateral_drift = drift_center * random.uniform(0.08, 0.22)
+            base_vx = random.uniform(-0.14, 0.14) * (0.82 + depth * 0.22)
+            rise_vy = random.uniform(-1.26, -0.76) * (0.9 + depth * 0.22)
+            sway = random.uniform(0.034, 0.082) * (0.9 + depth * 0.26)
+            life = random.uniform(360.0, 600.0)
+            glow_scale = 1.28 + depth * 0.24
+            highlight_scale = random.uniform(0.12, 0.2)
+        else:
+            lateral_drift = drift_center * random.uniform(0.05, 0.16)
+            base_vx = random.uniform(-0.12, 0.12) * (0.76 + depth * 0.28)
+            rise_vy = random.uniform(-1.84, -1.08) * (0.88 + depth * 0.32)
+            sway = random.uniform(0.024, 0.06) * (0.86 + depth * 0.42)
+            life = random.uniform(260.0, 410.0)
+            glow_scale = 1.8 + depth * 0.55
+            highlight_scale = random.uniform(0.2, 0.3)
+        color = QColor(random.choice(palette))
+        self._bubbles.append(
+            {
+                "x": origin_x,
+                "y": spawn_y,
+                "start_y": spawn_y,
+                "vx": base_vx + lateral_drift,
+                "vy": rise_vy,
+                "radius": radius,
+                "life": life,
+                "max_life": 0.0,
+                "phase": random.uniform(0.0, math.tau),
+                "alpha": alpha,
+                "depth": depth,
+                "sway": sway,
+                "glow_scale": glow_scale,
+                "highlight_scale": highlight_scale,
+                "impulse_x": 0.0,
+                "impulse_y": 0.0,
+                "micro": is_micro,
+                "color": color,
+            }
+        )
+        self._bubbles[-1]["max_life"] = self._bubbles[-1]["life"]
+
+    def _schedule_next_burst(self) -> None:
+        self._cooldown_ticks_remaining = random.randint(54, 116)
+        self._quiet_ticks_remaining = random.randint(14, 30)
+        self._burst_ticks_remaining = 0
+
+    def _start_burst(self) -> None:
+        self._burst_ticks_remaining = random.randint(9, 16)
+        self._cooldown_ticks_remaining = 0
+        self._quiet_ticks_remaining = 0
+
+    def prime_bubbles(self) -> None:
+        """Kick off a visible first wave once the overlay has real geometry."""
+        if self._bubbles or self.width() <= 48 or self.height() <= 48:
+            return
+        self._start_burst()
+        for _ in range(random.randint(10, 14)):
+            self._spawn_bubble()
+
+    def begin_hold_bubble(self, x: float, y: float) -> bool:
+        """Start growing a bubble at the pressed idle-background point."""
+        if self.width() <= 48 or self.height() <= 48:
+            return False
+
+        clamped_x = min(self.width() - 6.0, max(6.0, x))
+        clamped_y = min(self.height() - 8.0, max(8.0, y))
+        color = QColor(random.choice(self._bubble_palette()))
+        depth = random.uniform(0.1, 0.9)
+        self._held_bubble = {
+            "x": clamped_x,
+            "y": clamped_y,
+            "radius": 1.45,
+            "max_radius": 12.8,
+            "growth": 0.34,
+            "life": 0,
+            "alpha": 0.22,
+            "depth": depth,
+            "glow_scale": 1.32 + depth * 0.22,
+            "highlight_scale": random.uniform(0.16, 0.24),
+            "color": color,
+        }
+        self.update()
+        return True
+
+    def has_hold_bubble(self) -> bool:
+        """Return True while the user is growing a bubble on hold."""
+        return self._held_bubble is not None
+
+    def cancel_hold_bubble(self) -> None:
+        """Drop the current held bubble preview without spawning it."""
+        if self._held_bubble is None:
+            return
+        self._held_bubble = None
+        self.update()
+
+    def release_hold_bubble(self) -> bool:
+        """Convert the held preview into a real rising bubble."""
+        if self._held_bubble is None:
+            return False
+
+        held = self._held_bubble
+        self._held_bubble = None
+
+        radius = float(held["radius"])
+        depth = float(held["depth"])
+        is_micro = radius < 3.2
+        drift_center = (float(held["x"]) - (self.width() * 0.5)) / max(1.0, self.width() * 0.5)
+        if is_micro:
+            base_vx = random.uniform(-0.12, 0.12) * (0.82 + depth * 0.24)
+            rise_vy = random.uniform(-1.18, -0.78) * (0.92 + depth * 0.18)
+            sway = random.uniform(0.034, 0.072) * (0.9 + depth * 0.22)
+            life = random.uniform(260.0, 420.0)
+            glow_scale = 1.26 + depth * 0.2
+            highlight_scale = random.uniform(0.13, 0.2)
+            alpha = min(0.24, 0.11 + radius * 0.032)
+        else:
+            base_vx = random.uniform(-0.1, 0.1) * (0.78 + depth * 0.22)
+            rise_vy = random.uniform(-1.72, -1.05) * (0.9 + depth * 0.26)
+            sway = random.uniform(0.024, 0.056) * (0.88 + depth * 0.34)
+            life = random.uniform(220.0, 340.0)
+            glow_scale = 1.72 + depth * 0.44
+            highlight_scale = random.uniform(0.2, 0.28)
+            alpha = min(0.33, 0.17 + radius * 0.013)
+
+        self._bubbles.append(
+            {
+                "x": float(held["x"]),
+                "y": float(held["y"]),
+                "start_y": float(held["y"]),
+                "vx": base_vx + drift_center * random.uniform(0.03, 0.1),
+                "vy": rise_vy,
+                "radius": radius,
+                "life": life,
+                "max_life": life,
+                "phase": random.uniform(0.0, math.tau),
+                "alpha": alpha,
+                "depth": depth,
+                "sway": sway,
+                "glow_scale": glow_scale,
+                "highlight_scale": highlight_scale,
+                "impulse_x": 0.0,
+                "impulse_y": 0.0,
+                "micro": is_micro,
+                "color": QColor(held["color"]),
+            }
+        )
+        self.update()
+        return True
+
+    def _hit_test_bubble(self, x: float, y: float) -> int | None:
+        """Return the topmost bubble index under the given point, if any."""
+        for index in range(len(self._bubbles) - 1, -1, -1):
+            bubble = self._bubbles[index]
+            bubble_x = float(bubble["x"])
+            bubble_y = float(bubble["y"])
+            radius = float(bubble["radius"])
+            hit_radius = max(5.0, radius * (1.5 if bool(bubble.get("micro")) else 1.22))
+            if math.hypot(x - bubble_x, y - bubble_y) <= hit_radius:
+                return index
+        return None
+
+    def _spawn_pop_effect(self, bubble: dict[str, object]) -> None:
+        """Create a short-lived, underwater-style collapse with wake and daughter bubbles."""
+        x = float(bubble["x"])
+        y = float(bubble["y"])
+        radius = float(bubble["radius"])
+        color = QColor(bubble["color"])
+        micro = bool(bubble.get("micro"))
+        large_pop = (not micro) and radius >= 6.4
+        compression_color = QColor("#E6FCFF")
+        compression_color.setAlphaF(0.08 if micro else 0.11)
+        self._pop_effects.append(
+            {
+                "kind": "compression",
+                "x": x,
+                "y": y,
+                "radius_x": radius * (0.34 if micro else 0.42),
+                "radius_y": radius * (0.22 if micro else 0.28),
+                "grow_x": 0.42 if micro else 0.56,
+                "grow_y": 0.22 if micro else 0.3,
+                "vy": -0.015 if micro else -0.028,
+                "life": 9.0 if micro else 11.0,
+                "max_life": 9.0 if micro else 11.0,
+                "color": compression_color,
+                "base_alpha": compression_color.alphaF(),
+            }
+        )
+        snap_color = QColor("#F8FDFF")
+        snap_color.setAlphaF(0.18 if micro else 0.24)
+        self._pop_effects.append(
+            {
+                "kind": "snap",
+                "x": x,
+                "y": y,
+                "radius_x": radius * (0.26 if micro else 0.32),
+                "radius_y": radius * (0.22 if micro else 0.28),
+                "shrink_x": 0.55 if micro else 0.68,
+                "shrink_y": 0.44 if micro else 0.56,
+                "line_width": max(0.35, radius * 0.055),
+                "life": 7.0 if micro else 8.0,
+                "max_life": 7.0 if micro else 8.0,
+                "color": snap_color,
+                "base_alpha": snap_color.alphaF(),
+            }
+        )
+        if large_pop and random.random() < min(0.92, 0.26 + radius * 0.065):
+            wake_color = QColor("#A5F3FC")
+            wake_color.setAlphaF(0.095 if radius < 8.2 else 0.12)
+            for direction in (-1.0, 1.0):
+                self._pop_effects.append(
+                    {
+                        "kind": "wake",
+                        "x": x + direction * radius * 0.2,
+                        "y": y + radius * 0.05,
+                        "vx": direction * 0.12,
+                        "vy": -0.09,
+                        "radius_x": radius * 0.3,
+                        "radius_y": radius * 0.17,
+                        "grow_x": 0.24,
+                        "grow_y": 0.13,
+                        "life": 14.0,
+                        "max_life": 14.0,
+                        "color": wake_color,
+                        "base_alpha": wake_color.alphaF(),
+                    }
+                )
+        ripple_color = QColor("#DDFBFF")
+        ripple_color.setAlphaF(0.0)
+        self._pop_effects.append(
+            {
+                "kind": "ripple",
+                "x": x,
+                "y": y + radius * 0.04,
+                "radius_x": radius * (0.34 if micro else 0.42),
+                "radius_y": radius * (0.18 if micro else 0.22),
+                "grow_x": 0.28 if micro else 0.38,
+                "grow_y": 0.12 if micro else 0.18,
+                "line_width": max(0.2, radius * 0.02),
+                "life": 11.0 if micro else 13.0,
+                "max_life": 11.0 if micro else 13.0,
+                "source_radius": radius,
+                "wave_amplitude": (0.03 + radius * 0.0048) if micro else (0.052 + radius * 0.0085),
+                "color": ripple_color,
+                "base_alpha": ripple_color.alphaF(),
+            }
+        )
+
+        fragment_count = 8 if micro else (14 if large_pop else 10)
+        for _ in range(fragment_count):
+            fragment_color = QColor("#DDF8FF")
+            fragment_color.setAlphaF(0.14 if micro else 0.2)
+            angle = (-math.pi / 2.0) + random.gauss(0.0, 0.9)
+            speed = random.uniform(0.08, 0.22) if micro else random.uniform(0.12, 0.34)
+            self._pop_effects.append(
+                {
+                    "kind": "fragment",
+                    "x": x,
+                    "y": y,
+                    "vx": math.cos(angle) * speed,
+                    "vy": math.sin(angle) * speed - (0.24 if micro else 0.3),
+                    "radius": max(0.18, radius * (0.026 if micro else 0.036)),
+                    "life": 13.0 if micro else 15.0,
+                    "max_life": 13.0 if micro else 15.0,
+                    "color": fragment_color,
+                    "base_alpha": fragment_color.alphaF(),
+                }
+            )
+
+    def emit_click_puff(self, x: float, y: float) -> None:
+        """Release a tiny local puff of microbubbles from an idle-background click."""
+        if self.width() <= 0 or self.height() <= 0:
+            return
+
+        palette = (
+            QColor("#7DD3FC"),
+            QColor("#A5F3FC"),
+            QColor("#BAE6FD"),
+            QColor("#E0F2FE"),
+        )
+        count = random.randint(7, 11)
+        for _ in range(count):
+            depth = random.uniform(0.0, 1.0)
+            radius = random.uniform(0.48, 1.32) * (0.9 + depth * 0.12)
+            alpha = random.uniform(0.08, 0.15) * (0.82 + depth * 0.12)
+            bubble_x = min(
+                self.width() - radius,
+                max(radius, x + random.gauss(0.0, 8.4)),
+            )
+            bubble_y = min(
+                self.height() + radius * 0.8,
+                max(radius, y + random.gauss(0.0, 4.1)),
+            )
+            drift_center = (bubble_x - (self.width() * 0.5)) / max(1.0, self.width() * 0.5)
+            lateral_drift = drift_center * random.uniform(0.04, 0.14)
+            color = QColor(random.choice(palette))
+            self._bubbles.append(
+                {
+                    "x": bubble_x,
+                    "y": bubble_y,
+                    "start_y": bubble_y,
+                    "vx": random.uniform(-0.16, 0.16) * (0.84 + depth * 0.18) + lateral_drift,
+                    "vy": random.uniform(-1.22, -0.78) * (0.9 + depth * 0.2),
+                    "radius": radius,
+                    "life": random.uniform(160.0, 260.0),
+                    "max_life": 0.0,
+                    "phase": random.uniform(0.0, math.tau),
+                    "alpha": alpha,
+                    "depth": depth,
+                    "sway": random.uniform(0.032, 0.075) * (0.88 + depth * 0.2),
+                    "glow_scale": 1.22 + depth * 0.18,
+                    "highlight_scale": random.uniform(0.1, 0.17),
+                    "impulse_x": 0.0,
+                    "impulse_y": 0.0,
+                    "micro": True,
+                    "color": color,
+                }
+            )
+            self._bubbles[-1]["max_life"] = self._bubbles[-1]["life"]
+
+    def _apply_pop_impulse(self, popped_bubble: dict[str, object]) -> None:
+        """Push nearby bubbles outward briefly so the water feels reactive."""
+        source_x = float(popped_bubble["x"])
+        source_y = float(popped_bubble["y"])
+        source_radius = float(popped_bubble["radius"])
+        source_micro = bool(popped_bubble.get("micro"))
+        influence_radius = max(18.0, source_radius * (4.5 if source_micro else 6.2))
+        radius_energy = source_radius ** (1.1 if source_micro else 1.22)
+        base_impulse = (0.12 if source_micro else 0.18) + radius_energy * (
+            0.026 if source_micro else 0.038
+        )
+
+        for bubble in self._bubbles:
+            dx = float(bubble["x"]) - source_x
+            dy = float(bubble["y"]) - source_y
+            distance = math.hypot(dx, dy)
+            if distance <= 0.001 or distance > influence_radius:
+                continue
+
+            proximity = 1.0 - (distance / influence_radius)
+            direction_x = dx / distance
+            direction_y = dy / distance
+            target_radius = float(bubble["radius"])
+            target_micro = bool(bubble.get("micro"))
+            size_drag = 1.0 / max(0.75, 0.68 + target_radius * 0.11)
+            impulse_strength = base_impulse * proximity * size_drag
+            lateral_emphasis = 0.86 + abs(direction_x) * 0.42
+            vertical_bias = -proximity * (0.04 if target_micro else 0.055)
+
+            bubble["impulse_x"] = float(bubble.get("impulse_x", 0.0)) + (
+                direction_x * impulse_strength * lateral_emphasis
+            )
+            bubble["impulse_y"] = float(bubble.get("impulse_y", 0.0)) + (
+                direction_y * impulse_strength * 0.24 + vertical_bias
+            )
+            bubble["sway"] = min(
+                0.14 if target_micro else 0.1,
+                float(bubble["sway"]) * (1.0 + proximity * 0.12),
+            )
+            bubble["phase"] = float(bubble["phase"]) + proximity * 0.55
+
+    def _ripple_wave_offset(
+        self,
+        bubble: dict[str, object],
+        ripple_effects: list[dict[str, object]],
+    ) -> tuple[float, float]:
+        """Return the summed ripple-wave displacement at one bubble location."""
+        if not ripple_effects:
+            return 0.0, 0.0
+
+        bubble_x = float(bubble["x"])
+        bubble_y = float(bubble["y"])
+        total_x = 0.0
+        total_y = 0.0
+
+        for ripple in ripple_effects:
+            dx = bubble_x - float(ripple["x"])
+            dy = bubble_y - float(ripple["y"])
+            distance = math.hypot(dx, dy)
+            if distance <= 0.001:
+                continue
+
+            ripple_radius = (float(ripple["radius_x"]) + float(ripple["radius_y"])) * 0.5
+            source_radius = float(ripple.get("source_radius", ripple_radius))
+            band_width = max(5.5, source_radius * 0.72)
+            delta = distance - ripple_radius
+            max_delta = band_width * 1.35
+            if abs(delta) > max_delta:
+                continue
+
+            life_ratio = float(ripple["life"]) / max(1.0, float(ripple["max_life"]))
+            envelope = math.cos((abs(delta) / max_delta) * (math.pi / 2.0)) ** 2
+            phase = (delta / band_width) * math.pi
+            signed_amplitude = float(ripple.get("wave_amplitude", 0.0)) * life_ratio * envelope * math.cos(phase)
+            direction_x = dx / distance
+            direction_y = dy / distance
+
+            total_x += direction_x * signed_amplitude
+            total_y += direction_y * signed_amplitude * 0.55
+
+        return total_x, total_y
+
+    def try_pop_at(self, x: float, y: float) -> bool:
+        """Pop the topmost bubble at the given overlay-local coordinates."""
+        hit_index = self._hit_test_bubble(x, y)
+        if hit_index is None:
+            return False
+
+        bubble = self._bubbles.pop(hit_index)
+        self._spawn_pop_effect(bubble)
+        self._apply_pop_impulse(bubble)
+        if self._pop_audio_callback is not None:
+            try:
+                self._pop_audio_callback(bubble)
+            except Exception:
+                pass
+        self.update()
+        return True
+
+    def mousePressEvent(self, event) -> None:
+        """Pop bubbles on click while letting untouched areas behave normally."""
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+
+        if not self.try_pop_at(
+            event.position().x(),
+            event.position().y(),
+        ):
+            event.ignore()
+            return
+
+        event.accept()
+
+    def _tick_bubbles(self) -> None:
+        if not self.isVisible():
+            return
+
+        if self._held_bubble is not None:
+            self._held_bubble["life"] = int(self._held_bubble["life"]) + 1
+            self._held_bubble["radius"] = min(
+                float(self._held_bubble["max_radius"]),
+                float(self._held_bubble["radius"]) + float(self._held_bubble["growth"]),
+            )
+            held_progress = float(self._held_bubble["radius"]) / max(
+                1.0, float(self._held_bubble["max_radius"])
+            )
+            self._held_bubble["alpha"] = min(0.34, 0.14 + held_progress * 0.18)
+
+        ripple_effects = [
+            effect for effect in self._pop_effects if effect["kind"] == "ripple"
+        ]
+        active_bubbles: list[dict[str, object]] = []
+        for bubble in self._bubbles:
+            age = float(bubble["max_life"]) - float(bubble["life"])
+            impulse_x = float(bubble.get("impulse_x", 0.0))
+            impulse_y = float(bubble.get("impulse_y", 0.0))
+            ripple_x, ripple_y = self._ripple_wave_offset(bubble, ripple_effects)
+            bubble["x"] = (
+                float(bubble["x"])
+                + float(bubble["vx"])
+                + impulse_x
+                + ripple_x
+                + math.sin(age * 0.045 + float(bubble["phase"])) * float(bubble["sway"]) * 7.2
+            )
+            bubble["y"] = float(bubble["y"]) + float(bubble["vy"]) + impulse_y + ripple_y
+            bubble["life"] = float(bubble["life"]) - 1.0
+            bubble["impulse_x"] = impulse_x * 0.84
+            bubble["impulse_y"] = impulse_y * 0.84
+            if abs(float(bubble["impulse_x"])) < 0.002:
+                bubble["impulse_x"] = 0.0
+            if abs(float(bubble["impulse_y"])) < 0.002:
+                bubble["impulse_y"] = 0.0
+            radius = float(bubble["radius"])
+            if (
+                float(bubble["life"]) > 0.0
+                and -radius * 1.5 <= float(bubble["x"]) <= self.width() + radius * 1.5
+                and float(bubble["y"]) >= -(radius * 2.4)
+            ):
+                active_bubbles.append(bubble)
+
+        self._bubbles = active_bubbles
+
+        active_effects: list[dict[str, object]] = []
+        for effect in self._pop_effects:
+            effect["life"] = float(effect["life"]) - 1.0
+            if float(effect["life"]) <= 0.0:
+                continue
+
+            if effect["kind"] == "compression":
+                effect["radius_x"] = float(effect["radius_x"]) + float(effect["grow_x"])
+                effect["radius_y"] = float(effect["radius_y"]) + float(effect["grow_y"])
+                effect["y"] = float(effect["y"]) + float(effect["vy"])
+            elif effect["kind"] == "wake":
+                effect["x"] = float(effect["x"]) + float(effect["vx"])
+                effect["y"] = float(effect["y"]) + float(effect["vy"])
+                effect["radius_x"] = float(effect["radius_x"]) + float(effect["grow_x"])
+                effect["radius_y"] = float(effect["radius_y"]) + float(effect["grow_y"])
+            elif effect["kind"] == "snap":
+                effect["radius_x"] = max(0.1, float(effect["radius_x"]) - float(effect["shrink_x"]))
+                effect["radius_y"] = max(0.1, float(effect["radius_y"]) - float(effect["shrink_y"]))
+                effect["line_width"] = max(0.22, float(effect["line_width"]) * 0.9)
+            elif effect["kind"] == "ripple":
+                effect["radius_x"] = float(effect["radius_x"]) + float(effect["grow_x"])
+                effect["radius_y"] = float(effect["radius_y"]) + float(effect["grow_y"])
+                effect["line_width"] = max(0.3, float(effect["line_width"]) * 0.93)
+            else:
+                effect["x"] = float(effect["x"]) + float(effect["vx"])
+                effect["y"] = float(effect["y"]) + float(effect["vy"])
+                effect["vy"] = float(effect["vy"]) + 0.016
+                effect["radius"] = max(0.25, float(effect["radius"]) * 0.965)
+
+            active_effects.append(effect)
+
+        self._pop_effects = active_effects
+
+        if self._burst_ticks_remaining > 0:
+            self._burst_ticks_remaining -= 1
+            if len(self._bubbles) < 22 and random.random() < 0.78:
+                self._spawn_bubble()
+            if len(self._bubbles) < 18 and random.random() < 0.58:
+                self._spawn_bubble()
+            if len(self._bubbles) < 12 and random.random() < 0.24:
+                self._spawn_bubble()
+            if self._burst_ticks_remaining <= 0:
+                self._schedule_next_burst()
+        else:
+            if self._cooldown_ticks_remaining > 0:
+                self._cooldown_ticks_remaining -= 1
+            elif len(self._bubbles) > 2:
+                self._quiet_ticks_remaining = max(self._quiet_ticks_remaining, random.randint(10, 18))
+            elif self._quiet_ticks_remaining > 0:
+                self._quiet_ticks_remaining -= 1
+            elif random.random() < 0.14:
+                self._start_burst()
+
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        for bubble in sorted(self._bubbles, key=lambda item: float(item["depth"])):
+            life_ratio = float(bubble["life"]) / max(1.0, float(bubble["max_life"]))
+            depth = float(bubble["depth"])
+            x = float(bubble["x"])
+            y = float(bubble["y"])
+            start_y = float(bubble.get("start_y", y))
+            radius = float(bubble["radius"])
+            travel_span = max(90.0, start_y + radius * 2.8)
+            travel_ratio = min(1.0, max(0.0, (start_y - y) / travel_span))
+            fade_out = 1.0 if travel_ratio < 0.88 else max(0.0, 1.0 - ((travel_ratio - 0.88) / 0.12))
+            tail_fade = 1.0 if life_ratio > 0.18 else max(0.0, life_ratio / 0.18)
+            fade = fade_out * tail_fade
+            alpha = float(bubble["alpha"]) * fade
+            if alpha <= 0.0:
+                continue
+
+            bubble_rect = QRectF(x - radius, y - radius, radius * 2.0, radius * 2.0)
+            glow_radius = radius * float(bubble["glow_scale"])
+            tint = QColor(bubble["color"])
+
+            glow = QRadialGradient(x, y, glow_radius)
+            glow_outer = QColor(tint)
+            glow_outer.setAlphaF(0.0)
+            glow_mid = QColor(tint)
+            glow_mid.setAlphaF(alpha * (0.12 + depth * 0.06))
+            glow_inner = QColor("#F0FDFF")
+            glow_inner.setAlphaF(alpha * (0.08 + depth * 0.05))
+            glow.setColorAt(0.0, glow_inner)
+            glow.setColorAt(0.68, glow_mid)
+            glow.setColorAt(1.0, glow_outer)
+            painter.setBrush(glow)
+            painter.drawEllipse(
+                QRectF(
+                    x - glow_radius,
+                    y - glow_radius,
+                    glow_radius * 2.0,
+                    glow_radius * 2.0,
+                )
+            )
+
+            fill = QRadialGradient(
+                x - radius * 0.28,
+                y - radius * 0.34,
+                radius * 1.16,
+            )
+            fill_center = QColor("#F8FDFF")
+            fill_center.setAlphaF(alpha * 0.18)
+            fill_mid = QColor(tint)
+            fill_mid.setAlphaF(alpha * 0.10)
+            fill_outer = QColor(tint)
+            fill_outer.setAlphaF(alpha * 0.02)
+            fill.setColorAt(0.0, fill_center)
+            fill.setColorAt(0.48, fill_mid)
+            fill.setColorAt(1.0, fill_outer)
+            painter.setBrush(fill)
+            painter.drawEllipse(bubble_rect)
+
+            outline = QColor("#DDF8FF")
+            outline.setAlphaF(alpha * (0.72 + depth * 0.12))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(outline, max(1.15, radius * 0.08)))
+            painter.drawEllipse(bubble_rect)
+
+            reflection = QColor("#F8FDFF")
+            reflection.setAlphaF(alpha * (0.74 + depth * 0.08))
+            highlight_radius = radius * float(bubble["highlight_scale"])
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(reflection)
+            painter.drawEllipse(
+                QRectF(
+                    x - radius * 0.38,
+                    y - radius * 0.50,
+                    highlight_radius * 1.8,
+                    highlight_radius,
+                )
+            )
+
+            inner_glint = QColor("#CFFAFE")
+            inner_glint.setAlphaF(alpha * 0.28)
+            painter.setBrush(inner_glint)
+            painter.drawEllipse(
+                QRectF(
+                    x + radius * 0.08,
+                    y + radius * 0.08,
+                    radius * 0.22,
+                    radius * 0.22,
+                )
+            )
+
+        if self._held_bubble is not None:
+            held = self._held_bubble
+            x = float(held["x"])
+            y = float(held["y"])
+            radius = float(held["radius"])
+            alpha = float(held["alpha"])
+            depth = float(held["depth"])
+            tint = QColor(held["color"])
+            bubble_rect = QRectF(x - radius, y - radius, radius * 2.0, radius * 2.0)
+            glow_radius = radius * float(held["glow_scale"])
+
+            glow = QRadialGradient(x, y, glow_radius)
+            glow_outer = QColor(tint)
+            glow_outer.setAlphaF(0.0)
+            glow_mid = QColor(tint)
+            glow_mid.setAlphaF(alpha * (0.13 + depth * 0.06))
+            glow_inner = QColor("#F6FEFF")
+            glow_inner.setAlphaF(alpha * 0.16)
+            glow.setColorAt(0.0, glow_inner)
+            glow.setColorAt(0.7, glow_mid)
+            glow.setColorAt(1.0, glow_outer)
+            painter.setBrush(glow)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(
+                QRectF(
+                    x - glow_radius,
+                    y - glow_radius,
+                    glow_radius * 2.0,
+                    glow_radius * 2.0,
+                )
+            )
+
+            fill = QRadialGradient(
+                x - radius * 0.24,
+                y - radius * 0.28,
+                radius * 1.1,
+            )
+            fill_center = QColor("#FBFEFF")
+            fill_center.setAlphaF(alpha * 0.2)
+            fill_mid = QColor(tint)
+            fill_mid.setAlphaF(alpha * 0.11)
+            fill_outer = QColor(tint)
+            fill_outer.setAlphaF(alpha * 0.02)
+            fill.setColorAt(0.0, fill_center)
+            fill.setColorAt(0.5, fill_mid)
+            fill.setColorAt(1.0, fill_outer)
+            painter.setBrush(fill)
+            painter.drawEllipse(bubble_rect)
+
+            outline = QColor("#DDF8FF")
+            outline.setAlphaF(alpha * 0.84)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(outline, max(1.0, radius * 0.08)))
+            painter.drawEllipse(bubble_rect)
+
+            reflection = QColor("#F8FDFF")
+            reflection.setAlphaF(alpha * 0.78)
+            highlight_radius = radius * float(held["highlight_scale"])
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(reflection)
+            painter.drawEllipse(
+                QRectF(
+                    x - radius * 0.36,
+                    y - radius * 0.48,
+                    highlight_radius * 1.8,
+                    highlight_radius,
+                )
+            )
+
+        for effect in self._pop_effects:
+            life_ratio = float(effect["life"]) / max(1.0, float(effect["max_life"]))
+            color = QColor(effect["color"])
+            base_alpha = float(effect.get("base_alpha", color.alphaF()))
+            if effect["kind"] == "compression":
+                color.setAlphaF(base_alpha * life_ratio)
+                radius_x = float(effect["radius_x"])
+                radius_y = float(effect["radius_y"])
+                gradient_radius = max(radius_x, radius_y)
+                compression = QRadialGradient(
+                    float(effect["x"]),
+                    float(effect["y"]),
+                    gradient_radius,
+                )
+                inner = QColor(color)
+                inner.setAlphaF(base_alpha * life_ratio * 0.34)
+                mid = QColor(color)
+                mid.setAlphaF(base_alpha * life_ratio * 0.14)
+                outer = QColor(color)
+                outer.setAlphaF(0.0)
+                compression.setColorAt(0.0, inner)
+                compression.setColorAt(0.52, mid)
+                compression.setColorAt(1.0, outer)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(compression)
+                painter.drawEllipse(
+                    QRectF(
+                        float(effect["x"]) - radius_x,
+                        float(effect["y"]) - radius_y,
+                        radius_x * 2.0,
+                        radius_y * 2.0,
+                    )
+                )
+            elif effect["kind"] == "wake":
+                color.setAlphaF(base_alpha * life_ratio)
+                radius_x = float(effect["radius_x"])
+                radius_y = float(effect["radius_y"])
+                gradient_radius = max(radius_x, radius_y)
+                wake = QRadialGradient(
+                    float(effect["x"]),
+                    float(effect["y"]),
+                    gradient_radius,
+                )
+                inner = QColor(color)
+                inner.setAlphaF(base_alpha * life_ratio * 0.28)
+                mid = QColor(color)
+                mid.setAlphaF(base_alpha * life_ratio * 0.12)
+                outer = QColor(color)
+                outer.setAlphaF(0.0)
+                wake.setColorAt(0.0, inner)
+                wake.setColorAt(0.48, mid)
+                wake.setColorAt(1.0, outer)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(wake)
+                painter.drawEllipse(
+                    QRectF(
+                        float(effect["x"]) - radius_x,
+                        float(effect["y"]) - radius_y,
+                        radius_x * 2.0,
+                        radius_y * 2.0,
+                    )
+                )
+            elif effect["kind"] == "snap":
+                color.setAlphaF(base_alpha * life_ratio)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(color, float(effect["line_width"])))
+                radius_x = float(effect["radius_x"])
+                radius_y = float(effect["radius_y"])
+                painter.drawEllipse(
+                    QRectF(
+                        float(effect["x"]) - radius_x,
+                        float(effect["y"]) - radius_y,
+                        radius_x * 2.0,
+                        radius_y * 2.0,
+                    )
+                )
+            elif effect["kind"] == "ripple":
+                continue
+            elif effect["kind"] == "fragment":
+                color.setAlphaF(base_alpha * life_ratio)
+                radius = float(effect["radius"])
+                painter.setPen(QPen(color, max(0.22, radius * 0.9)))
+                fill = QColor("#F8FDFF")
+                fill.setAlphaF(base_alpha * life_ratio * 0.24)
+                painter.setBrush(fill)
+                painter.drawEllipse(
+                    QRectF(
+                        float(effect["x"]) - radius,
+                        float(effect["y"]) - radius,
+                        radius * 2.0,
+                        radius * 2.0,
+                    )
+                )
+            else:
+                color.setAlphaF(base_alpha * life_ratio)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                radius = float(effect["radius"])
+                painter.drawEllipse(
+                    QRectF(
+                        float(effect["x"]) - radius,
+                        float(effect["y"]) - radius,
+                        radius * 2.0,
+                        radius * 2.0,
+                    )
+                )
+
+        painter.end()
 
 
 class ExtractionThread(QThread):
@@ -188,12 +1093,12 @@ class ExtractionThread(QThread):
     def _raise_if_stop_requested(self) -> None:
         """Abort promptly when a stop request is active."""
         if self._is_stop_requested():
-            raise InterruptedError("Run stopped by user.")
+            raise InterruptedError("Stopped.")
 
     def _finalize_cancellation(self, excel_handler=None) -> None:
         """Save partial work when possible and emit a calm cancelled state."""
         output_path = None
-        message = "Run stopped by user."
+        message = ""
 
         if excel_handler is not None and self.excel_path:
             try:
@@ -205,13 +1110,13 @@ class ExtractionThread(QThread):
                     f"Successfully saved partial Excel file: {self.excel_path}"
                 )
                 output_path = self.excel_path
-                message += " Partial progress was saved."
+                message = "Progress so far was saved."
             except Exception as e:
                 if self.logger:
                     self.logger.log(
                         f"Could not save partial Excel file after stop request: {e}"
                     )
-                message += " Partial progress could not be saved automatically."
+                message = "Progress so far couldn't be saved automatically."
 
         if self.logger:
             try:
@@ -585,7 +1490,7 @@ class ExtractionThread(QThread):
                 self.finished.emit(False, f"Failed to save output file: {e}", None)
                 return
 
-            completion_message = "Extraction completed successfully."
+            completion_message = "Workbook saved."
 
             try:
                 self._raise_if_stop_requested()
@@ -614,9 +1519,8 @@ class ExtractionThread(QThread):
                     )
 
                 completion_message = (
-                    "Extraction completed successfully. "
-                    f"Outlook email sent with {email_summary.success_count} available "
-                    f"{'document' if email_summary.success_count == 1 else 'documents'}."
+                    f"Email sent with {email_summary.success_count} "
+                    f"available {'document' if email_summary.success_count == 1 else 'documents'}."
                 )
             except NoSuccessfulExtractionsError as e:
                 self.logger.log(str(e))
@@ -627,8 +1531,8 @@ class ExtractionThread(QThread):
                 error_msg = f"Error sending Outlook email: {e}\n{traceback.format_exc()}"
                 self.logger.log(error_msg)
                 completion_message = (
-                    "Extraction completed successfully, but the Outlook email could not "
-                    f"be sent automatically: {e}"
+                    "Workbook saved, but the email couldn't be sent automatically.\n\n"
+                    f"{e}"
                 )
 
             try:
@@ -709,6 +1613,624 @@ class FloatingPopupComboBox(QComboBox):
         popup_view = self.view()
         popup_view.setMinimumWidth(self.width())
         super().showPopup()
+
+
+class CalendarHeaderPopup(QFrame):
+    """Dedicated popup list for month and year selection inside the calendar header."""
+
+    index_selected = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None, visible_row_limit: int = 5):
+        super().__init__(parent)
+        self.setObjectName("CalendarHeaderPopup")
+        self.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.visible_row_limit = max(1, visible_row_limit)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.panel = QFrame()
+        self.panel.setObjectName("CalendarHeaderPopupPanel")
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setSpacing(0)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setObjectName("CalendarHeaderList")
+        self.list_widget.setSpacing(4)
+        self.list_widget.setFrameShape(QFrame.Shape.NoFrame)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.list_widget.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.list_widget.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.list_widget.itemClicked.connect(self._on_item_clicked)
+        self.list_widget.itemActivated.connect(self._on_item_clicked)
+        panel_layout.addWidget(self.list_widget)
+        layout.addWidget(self.panel)
+
+    def set_visible_row_limit(self, limit: int) -> None:
+        """Update the maximum number of visible rows before scrolling."""
+        self.visible_row_limit = max(1, limit)
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        """Emit the selected combo index and close the popup."""
+        selected_index = item.data(Qt.ItemDataRole.UserRole)
+        if selected_index is None:
+            return
+        self.index_selected.emit(int(selected_index))
+        self.hide()
+
+    def _visible_row_count(self) -> int:
+        """Clamp popup height to a compact, scrollable number of rows."""
+        return max(1, min(self.visible_row_limit, self.list_widget.count()))
+
+    def refresh_from_combo(self, combo: QComboBox) -> None:
+        """Mirror combo text and icons into the dedicated popup list."""
+        self.list_widget.clear()
+        for index in range(combo.count()):
+            item = QListWidgetItem(combo.itemIcon(index), combo.itemText(index))
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.list_widget.addItem(item)
+
+        self.list_widget.setCurrentRow(max(0, combo.currentIndex()))
+
+    def show_for_combo(self, combo: QComboBox) -> None:
+        """Position the popup beneath the header combo and sync selection."""
+        self.setStyleSheet(combo.window().styleSheet())
+        self.refresh_from_combo(combo)
+
+        row_height = self.list_widget.sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = 36
+        visible_rows = self._visible_row_count()
+        list_height = (row_height * visible_rows) + (self.list_widget.spacing() * (visible_rows - 1))
+        popup_height = list_height + 24
+        popup_width = max(combo.width(), 132)
+
+        anchor = combo.mapToGlobal(QPoint(0, combo.height() + 6))
+        self.resize(popup_width, popup_height)
+        self.move(anchor)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.list_widget.setFocus()
+        current_item = self.list_widget.currentItem()
+        if current_item is not None:
+            self.list_widget.scrollToItem(current_item, QListWidget.ScrollHint.PositionAtCenter)
+
+
+class CalendarHeaderComboBox(FloatingPopupComboBox):
+    """Header combo shell backed by a dedicated rounded popup list."""
+
+    def __init__(self, parent: QWidget | None = None, visible_row_limit: int = 5):
+        super().__init__(parent)
+        self.header_popup = CalendarHeaderPopup(self, visible_row_limit=visible_row_limit)
+        self.header_popup.index_selected.connect(self._apply_popup_selection)
+
+    def setPopupVisibleRowLimit(self, visible_row_limit: int) -> None:
+        """Allow the parent header to clamp popup rows without native combo behavior."""
+        self.header_popup.set_visible_row_limit(visible_row_limit)
+
+    def _apply_popup_selection(self, index: int) -> None:
+        """Apply a popup selection back into the combo shell."""
+        self.setCurrentIndex(index)
+
+    def showPopup(self):
+        """Show the dedicated rounded popup instead of the standard combo list."""
+        if not self.isEnabled():
+            return
+        self.header_popup.show_for_combo(self)
+
+    def hidePopup(self):
+        """Hide the dedicated popup when Qt requests closure."""
+        self.header_popup.hide()
+
+
+class CalendarHeaderSelector(QPushButton):
+    """Button-style calendar header selector that reuses the dedicated popup list."""
+
+    currentIndexChanged = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None, visible_row_limit: int = 5):
+        super().__init__(parent)
+        self._items: list[tuple[str, object | None]] = []
+        self._current_index = -1
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.setIconSize(QSize(10, 7))
+
+        chevron_icon_path = Path(__file__).resolve().parent.parent / "assets" / "chevron_down.png"
+        if chevron_icon_path.exists():
+            self.setIcon(QIcon(str(chevron_icon_path)))
+
+        self.header_popup = CalendarHeaderPopup(self, visible_row_limit=visible_row_limit)
+        self.header_popup.index_selected.connect(self._apply_popup_selection)
+
+    def setPopupVisibleRowLimit(self, visible_row_limit: int) -> None:
+        """Allow the parent header to clamp popup rows."""
+        self.header_popup.set_visible_row_limit(visible_row_limit)
+
+    def clear(self) -> None:
+        """Remove all selector items."""
+        self._items.clear()
+        self._current_index = -1
+        self.setText("")
+
+    def addItem(self, text: str, user_data=None) -> None:
+        """Append one selectable item to the header selector."""
+        self._items.append((text, user_data))
+        if self._current_index < 0:
+            self.setCurrentIndex(0)
+
+    def count(self) -> int:
+        """Return the number of items available in the selector."""
+        return len(self._items)
+
+    def itemText(self, index: int) -> str:
+        """Return the visible label for one selector row."""
+        if 0 <= index < len(self._items):
+            return self._items[index][0]
+        return ""
+
+    def itemIcon(self, index: int) -> QIcon:
+        """Return the icon for one selector row."""
+        return QIcon()
+
+    def itemData(self, index: int):
+        """Return the stored user data for one selector row."""
+        if 0 <= index < len(self._items):
+            return self._items[index][1]
+        return None
+
+    def currentIndex(self) -> int:
+        """Return the active selector index."""
+        return self._current_index
+
+    def setCurrentIndex(self, index: int) -> None:
+        """Update the active selector item and refresh the button label."""
+        if not (0 <= index < len(self._items)):
+            return
+        changed = index != self._current_index
+        self._current_index = index
+        self.setText(self._items[index][0])
+        if changed:
+            self.currentIndexChanged.emit(index)
+
+    def findData(self, value) -> int:
+        """Find the first selector row whose user data matches the value."""
+        for index, (_text, data) in enumerate(self._items):
+            if data == value:
+                return index
+        return -1
+
+    def _apply_popup_selection(self, index: int) -> None:
+        """Apply a popup selection back into the visible header button."""
+        self.setCurrentIndex(index)
+
+    def showPopup(self) -> None:
+        """Show the dedicated popup list beneath the selector button."""
+        if not self.isEnabled():
+            return
+        self.header_popup.show_for_combo(self)
+
+    def hidePopup(self) -> None:
+        """Hide the dedicated popup list."""
+        self.header_popup.hide()
+
+    def mousePressEvent(self, event) -> None:
+        """Toggle the popup when the header button is clicked."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.header_popup.isVisible():
+                self.header_popup.hide()
+            else:
+                self.showPopup()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        """Support keyboard opening for the selector popup."""
+        if event.key() in (
+            Qt.Key.Key_Down,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+            Qt.Key.Key_Space,
+            Qt.Key.Key_F4,
+        ):
+            if self.header_popup.isVisible():
+                self.header_popup.hide()
+            else:
+                self.showPopup()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class ThemedCalendarPopup(QFrame):
+    """Compact themed calendar popup for date-range selection."""
+
+    date_selected = pyqtSignal(QDate)
+    closed = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("DatePickerPopup")
+        self.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self.owner_edit: ThemedDateEdit | None = None
+        self._year_span = 20
+        self._app_event_filter_installed = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.shell = QFrame()
+        self.shell.setObjectName("DatePickerPopupShell")
+        shell_layout = QVBoxLayout(self.shell)
+        shell_layout.setSpacing(8)
+        shell_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.header = QWidget()
+        self.header.setObjectName("DatePickerHeader")
+        header_layout = QHBoxLayout(self.header)
+        header_layout.setSpacing(8)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.previous_button = QPushButton("‹")
+        self.previous_button.setObjectName("DatePickerNavButton")
+        self.previous_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.previous_button.clicked.connect(self._show_previous_month)
+        header_layout.addWidget(self.previous_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.month_combo = CalendarHeaderSelector(visible_row_limit=5)
+        self.month_combo.setObjectName("DatePickerMonthCombo")
+        self._configure_header_combo(self.month_combo, max_visible_items=5)
+        self.month_combo.currentIndexChanged.connect(self._on_month_changed)
+        header_layout.addWidget(self.month_combo, 1, Qt.AlignmentFlag.AlignVCenter)
+
+        self.year_combo = CalendarHeaderSelector(visible_row_limit=5)
+        self.year_combo.setObjectName("DatePickerYearCombo")
+        self._configure_header_combo(self.year_combo, max_visible_items=5)
+        self.year_combo.currentIndexChanged.connect(self._on_year_changed)
+        header_layout.addWidget(self.year_combo, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.next_button = QPushButton("›")
+        self.next_button.setObjectName("DatePickerNavButton")
+        self.next_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.next_button.clicked.connect(self._show_next_month)
+        header_layout.addWidget(self.next_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        shell_layout.addWidget(self.header)
+
+        self.calendar = QCalendarWidget()
+        self.calendar.setObjectName("DatePickerCalendar")
+        self.calendar.setNavigationBarVisible(False)
+        self.calendar.setDateEditEnabled(False)
+        self.calendar.setGridVisible(False)
+        self.calendar.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader
+        )
+        self.calendar.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.ShortDayNames
+        )
+        self.calendar.clicked.connect(self._on_date_chosen)
+        self.calendar.activated.connect(self._on_date_chosen)
+        self.calendar.currentPageChanged.connect(self._sync_title)
+        shell_layout.addWidget(self.calendar)
+
+        layout.addWidget(self.shell)
+        self._populate_month_combo()
+        self._apply_calendar_formats()
+        self.resize(324, 294)
+
+    def _configure_header_combo(self, combo: QWidget, max_visible_items: int) -> None:
+        """Make month and year selectors feel like compact header controls."""
+        combo.setMinimumHeight(40)
+        combo.setMaximumHeight(40)
+        combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        if hasattr(combo, "setPopupVisibleRowLimit"):
+            combo.setPopupVisibleRowLimit(max_visible_items)
+
+    def _populate_month_combo(self) -> None:
+        """Fill the month selector with human-friendly month labels."""
+        self.month_combo.blockSignals(True)
+        self.month_combo.clear()
+        for month in range(1, 13):
+            self.month_combo.addItem(date(2000, month, 1).strftime("%B"), month)
+        self.month_combo.blockSignals(False)
+
+    def _refresh_year_combo(self, visible_year: int) -> None:
+        """Keep a focused, scrollable year range around the current page."""
+        minimum_year = 1900
+        maximum_year = 2100
+
+        if self.owner_edit is not None:
+            owner_minimum = self.owner_edit.minimumDate().year()
+            owner_maximum = self.owner_edit.maximumDate().year()
+            if owner_minimum > minimum_year:
+                minimum_year = owner_minimum
+            if owner_maximum < maximum_year:
+                maximum_year = owner_maximum
+
+        if maximum_year < minimum_year:
+            minimum_year, maximum_year = maximum_year, minimum_year
+
+        start_year = max(minimum_year, visible_year - self._year_span)
+        end_year = min(maximum_year, visible_year + self._year_span)
+
+        self.year_combo.blockSignals(True)
+        self.year_combo.clear()
+        for year in range(start_year, end_year + 1):
+            self.year_combo.addItem(str(year), year)
+        selected_index = self.year_combo.findData(visible_year)
+        if selected_index >= 0:
+            self.year_combo.setCurrentIndex(selected_index)
+        self.year_combo.blockSignals(False)
+
+    def _apply_calendar_formats(self) -> None:
+        """Apply stable weekday and today styling so Qt defaults do not leak through."""
+        header_format = QTextCharFormat()
+        header_format.setForeground(QColor("#cbd5e1"))
+        self.calendar.setHeaderTextFormat(header_format)
+
+        weekday_format = QTextCharFormat()
+        weekday_format.setForeground(QColor("#dbe7f5"))
+        weekend_format = QTextCharFormat()
+        weekend_format.setForeground(QColor("#f8fafc"))
+        today_format = QTextCharFormat()
+        today_format.setForeground(QColor("#67e8f9"))
+        today_format.setFontWeight(QFont.Weight.DemiBold)
+
+        for weekday in (
+            Qt.DayOfWeek.Monday,
+            Qt.DayOfWeek.Tuesday,
+            Qt.DayOfWeek.Wednesday,
+            Qt.DayOfWeek.Thursday,
+            Qt.DayOfWeek.Friday,
+        ):
+            self.calendar.setWeekdayTextFormat(weekday, weekday_format)
+
+        self.calendar.setWeekdayTextFormat(Qt.DayOfWeek.Saturday, weekend_format)
+        self.calendar.setWeekdayTextFormat(Qt.DayOfWeek.Sunday, weekend_format)
+        self.calendar.setDateTextFormat(QDate.currentDate(), today_format)
+
+    def _month_title(self, year: int, month: int) -> str:
+        """Return a clean English month-year label for the popup header."""
+        return f"{date(year, month, 1).strftime('%B')} {year}"
+
+    def _sync_title(self, year: int, month: int) -> None:
+        """Keep the popup month and year selectors aligned with the visible page."""
+        if self.year_combo.findData(year) < 0:
+            self._refresh_year_combo(year)
+
+        self.month_combo.blockSignals(True)
+        month_index = self.month_combo.findData(month)
+        if month_index >= 0:
+            self.month_combo.setCurrentIndex(month_index)
+        self.month_combo.blockSignals(False)
+
+        self.year_combo.blockSignals(True)
+        year_index = self.year_combo.findData(year)
+        if year_index >= 0:
+            self.year_combo.setCurrentIndex(year_index)
+        self.year_combo.blockSignals(False)
+
+    def _show_previous_month(self) -> None:
+        """Move the visible calendar page backward by one month."""
+        self.calendar.showPreviousMonth()
+
+    def _show_next_month(self) -> None:
+        """Move the visible calendar page forward by one month."""
+        self.calendar.showNextMonth()
+
+    def _on_month_changed(self, index: int) -> None:
+        """Jump directly to a chosen month from the popup header."""
+        if index < 0:
+            return
+        month = self.month_combo.itemData(index)
+        if not month:
+            return
+        self.calendar.setCurrentPage(self.calendar.yearShown(), int(month))
+
+    def _on_year_changed(self, index: int) -> None:
+        """Jump directly to a chosen year from the popup header."""
+        if index < 0:
+            return
+        year = self.year_combo.itemData(index)
+        if not year:
+            return
+        self.calendar.setCurrentPage(int(year), self.calendar.monthShown())
+
+    def _on_date_chosen(self, selected_date: QDate) -> None:
+        """Commit a chosen date back into the owning editor and close the popup."""
+        self.date_selected.emit(selected_date)
+        self.hide()
+
+    def _interactive_popup_surfaces(self) -> tuple[QWidget, ...]:
+        """Return all visible surfaces that count as inside the active picker."""
+        surfaces: list[QWidget] = [self]
+
+        if self.owner_edit is not None:
+            surfaces.append(self.owner_edit)
+
+        for selector_name in ("month_combo", "year_combo"):
+            selector = getattr(self, selector_name, None)
+            header_popup = getattr(selector, "header_popup", None) if selector is not None else None
+            if header_popup is not None and header_popup.isVisible():
+                surfaces.append(header_popup)
+
+        return tuple(surfaces)
+
+    def _global_rect_for_widget(self, widget: QWidget | None) -> QRect | None:
+        """Return one widget rect in global coordinates when visible."""
+        if widget is None or not widget.isVisible():
+            return None
+        return QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+
+    def _global_pos_within_picker(self, global_pos: QPoint) -> bool:
+        """Return True when a click lands inside the picker or its attached controls."""
+        for surface in self._interactive_popup_surfaces():
+            surface_rect = self._global_rect_for_widget(surface)
+            if surface_rect is not None and surface_rect.adjusted(-2, -2, 2, 2).contains(global_pos):
+                return True
+        return False
+
+    def eventFilter(self, watched, event):
+        """Close the picker when the user clicks outside any active picker surface."""
+        if (
+            self.isVisible()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton
+        ):
+            global_pos = event.globalPosition().toPoint()
+            if not self._global_pos_within_picker(global_pos):
+                self.hide()
+
+        return super().eventFilter(watched, event)
+
+    def show_for_editor(self, date_edit: ThemedDateEdit) -> None:
+        """Open the popup below the supplied editor and clamp it on-screen."""
+        self.owner_edit = date_edit
+        self.setStyleSheet(date_edit.window().styleSheet())
+
+        selected_date = date_edit.date()
+        self.calendar.setMinimumDate(date_edit.minimumDate())
+        self.calendar.setMaximumDate(date_edit.maximumDate())
+        self.calendar.setSelectedDate(selected_date)
+        self._refresh_year_combo(selected_date.year())
+        self.calendar.setCurrentPage(selected_date.year(), selected_date.month())
+        self._sync_title(selected_date.year(), selected_date.month())
+
+        popup_width = max(324, date_edit.width() + 58)
+        popup_height = 294
+        self.resize(popup_width, popup_height)
+
+        anchor_below = date_edit.mapToGlobal(QPoint(0, date_edit.height() + 8))
+        screen = QApplication.screenAt(anchor_below)
+        if screen is None:
+            screen = date_edit.screen()
+        geometry = screen.availableGeometry() if screen is not None else date_edit.window().frameGeometry()
+
+        x = max(
+            geometry.left() + 8,
+            min(anchor_below.x(), geometry.right() - popup_width - 8),
+        )
+        y = anchor_below.y()
+
+        if y + popup_height > geometry.bottom() - 8:
+            anchor_above = date_edit.mapToGlobal(QPoint(0, -(popup_height + 8)))
+            y = max(
+                geometry.top() + 8,
+                min(anchor_above.y(), geometry.bottom() - popup_height - 8),
+            )
+
+        self.move(x, y)
+        app = QApplication.instance()
+        if app is not None and not self._app_event_filter_installed:
+            app.installEventFilter(self)
+            self._app_event_filter_installed = True
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.calendar.setFocus()
+
+    def hideEvent(self, event) -> None:
+        """Reset popup ownership and notify the parent when it closes."""
+        app = QApplication.instance()
+        if app is not None and self._app_event_filter_installed:
+            app.removeEventFilter(self)
+            self._app_event_filter_installed = False
+        self.owner_edit = None
+        super().hideEvent(event)
+        self.closed.emit()
+
+
+class ThemedDateEdit(QDateEdit):
+    """Read-only themed date field backed by a custom popup calendar."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setCalendarPopup(True)
+        self.setKeyboardTracking(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.calendar_popup_widget = ThemedCalendarPopup(self)
+        self.calendar_popup_widget.date_selected.connect(self._apply_selected_date)
+
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            line_edit.setReadOnly(True)
+            line_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+            line_edit.installEventFilter(self)
+
+    def _apply_selected_date(self, selected_date: QDate) -> None:
+        """Update the field when the custom popup returns a chosen date."""
+        self.setDate(selected_date)
+
+    def toggle_calendar_popup(self) -> None:
+        """Toggle the custom themed popup instead of Qt's native one."""
+        if self.calendar_popup_widget.isVisible():
+            self.calendar_popup_widget.hide()
+            return
+        self.calendar_popup_widget.show_for_editor(self)
+
+    def eventFilter(self, watched, event):
+        """Treat clicks on the inner line-edit as clicks on the whole field."""
+        line_edit = self.lineEdit()
+        if watched is line_edit and event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+        ):
+            if getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
+                self.toggle_calendar_popup()
+                return True
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event) -> None:
+        """Open the themed calendar when the field itself is clicked."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_calendar_popup()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        """Open or close the themed calendar for common picker keys."""
+        if event.key() == Qt.Key.Key_Escape and self.calendar_popup_widget.isVisible():
+            self.calendar_popup_widget.hide()
+            event.accept()
+            return
+
+        if event.key() in (
+            Qt.Key.Key_Down,
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+            Qt.Key.Key_Space,
+            Qt.Key.Key_F4,
+        ):
+            self.toggle_calendar_popup()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        """Ignore wheel scrolling so dates do not shift accidentally."""
+        event.ignore()
 
 
 class HeaderColorPopup(QFrame):
@@ -1135,6 +2657,559 @@ class SettingsPopup(QFrame):
         super().hideEvent(event)
 
 
+class ThemedMessageDialog(QDialog):
+    """Custom in-theme modal dialog for information, warnings, errors, and confirmations."""
+
+    TONE_META = {
+        "info": {
+            "pill": "INFO",
+            "glyph": "i",
+            "bg": "#082f49",
+            "border": "#0e7490",
+            "text": "#67e8f9",
+        },
+        "success": {
+            "pill": "DONE",
+            "glyph": "✓",
+            "bg": "#052e16",
+            "border": "#166534",
+            "text": "#86efac",
+        },
+        "warning": {
+            "pill": "WARNING",
+            "glyph": "!",
+            "bg": "#3b2503",
+            "border": "#854d0e",
+            "text": "#fbbf24",
+        },
+        "error": {
+            "pill": "ERROR",
+            "glyph": "!",
+            "bg": "#3b0a10",
+            "border": "#991b1b",
+            "text": "#fda4af",
+        },
+        "question": {
+            "pill": "CONFIRM",
+            "glyph": "?",
+            "bg": "#172554",
+            "border": "#1d4ed8",
+            "text": "#93c5fd",
+        },
+    }
+
+    BUTTON_TEXT = {
+        "ok": "OK",
+        "yes": "Yes",
+        "no": "No",
+        "cancel": "Cancel",
+    }
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        title: str,
+        message: str,
+        tone: str = "info",
+        buttons: tuple[str, ...] = ("ok",),
+        default_button: str = "ok",
+        title_font_family: str = "",
+    ):
+        super().__init__(parent)
+        self.setObjectName("ThemedMessageDialog")
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if parent is not None:
+            self.setStyleSheet(parent.styleSheet())
+
+        self.title_font_family = title_font_family
+        self._drag_offset = None
+        self._buttons = buttons or ("ok",)
+        self._close_choice = self._buttons[-1] if len(self._buttons) > 1 else self._buttons[0]
+        self.choice = self._close_choice
+        tone_meta = dict(self.TONE_META.get(tone, self.TONE_META["info"]))
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.shell = QFrame()
+        self.shell.setObjectName("DialogShell")
+        shadow = QGraphicsDropShadowEffect(self.shell)
+        shadow.setBlurRadius(36)
+        shadow.setOffset(0, 14)
+        shadow.setColor(QColor(2, 6, 23, 180))
+        self.shell.setGraphicsEffect(shadow)
+        shell_layout = QVBoxLayout(self.shell)
+        shell_layout.setSpacing(14)
+        shell_layout.setContentsMargins(18, 18, 18, 16)
+        layout.addWidget(self.shell)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(6)
+        title_stack.setContentsMargins(0, 0, 0, 0)
+
+        tone_pill = QLabel(tone_meta["pill"])
+        tone_pill.setObjectName("DialogTonePill")
+        tone_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tone_pill.setStyleSheet(
+            f"""
+            QLabel#DialogTonePill {{
+                background-color: {tone_meta['bg']};
+                color: {tone_meta['text']};
+                border: 1px solid {tone_meta['border']};
+                border-radius: 10px;
+                padding: 3px 9px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            """
+        )
+        title_stack.addWidget(tone_pill, 0, Qt.AlignmentFlag.AlignLeft)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("DialogTitle")
+        title_label.setWordWrap(True)
+        if self.title_font_family:
+            dialog_title_font = QFont(self.title_font_family, 15)
+            dialog_title_font.setWeight(QFont.Weight.Black)
+            title_label.setFont(dialog_title_font)
+        title_stack.addWidget(title_label)
+        top_row.addLayout(title_stack, 1)
+
+        close_btn = QPushButton("×")
+        close_btn.setObjectName("DialogCloseButton")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Close")
+        close_btn.clicked.connect(lambda: self._finish(self._close_choice))
+        top_row.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+
+        shell_layout.addLayout(top_row)
+
+        if message.strip():
+            divider = QFrame()
+            divider.setObjectName("DialogDivider")
+            divider.setFixedHeight(1)
+            shell_layout.addWidget(divider)
+
+            body_label = QLabel(message)
+            body_label.setObjectName("DialogBody")
+            body_label.setWordWrap(True)
+            body_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            body_label.setMinimumWidth(360)
+            body_label.setMaximumWidth(420)
+            shell_layout.addWidget(body_label)
+
+        buttons_row = QHBoxLayout()
+        buttons_row.setSpacing(8)
+        buttons_row.setContentsMargins(0, 4, 0, 0)
+        buttons_row.addStretch(1)
+
+        for button_key in self._buttons:
+            button = QPushButton(self.BUTTON_TEXT.get(button_key, button_key.title()))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(38)
+            button.setMinimumWidth(92)
+            if button_key in {"ok", "yes"}:
+                button.setObjectName("DialogPrimaryButton")
+            else:
+                button.setObjectName("DialogSecondaryButton")
+            button.clicked.connect(lambda _checked=False, key=button_key: self._finish(key))
+            button.setAutoDefault(button_key == default_button)
+            button.setDefault(button_key == default_button)
+            buttons_row.addWidget(button)
+
+        shell_layout.addLayout(buttons_row)
+
+        self.adjustSize()
+        self.setMinimumWidth(self.shell.sizeHint().width())
+
+    def _finish(self, choice: str) -> None:
+        """Store the selected button and close using the matching dialog result."""
+        self.choice = choice
+        if choice in {"ok", "yes"}:
+            self.accept()
+            return
+        self.reject()
+
+    def reject(self) -> None:
+        """Treat escape and close actions the same way as the explicit close button."""
+        self.choice = self._close_choice
+        super().reject()
+
+    def showEvent(self, event):
+        """Center the dialog over the parent window when shown."""
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent is not None:
+            parent_center = parent.frameGeometry().center()
+            dialog_rect = self.frameGeometry()
+            dialog_rect.moveCenter(parent_center)
+            self.move(dialog_rect.topLeft())
+
+    def mousePressEvent(self, event):
+        """Allow dragging the frameless dialog by its surface."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Move the dialog while dragging."""
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_offset is not None
+        ):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Clear drag state after moving the dialog."""
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class UnderwaterLightOverlay(QWidget):
+    """Soft animated caustic light that enriches the idle wallpaper without blocking UI."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._phase = random.uniform(0.0, math.tau)
+        seed_rng = random.Random(41209)
+        self._caustic_seeds = [
+            (
+                seed_rng.uniform(0.02, 0.98),
+                seed_rng.uniform(0.04, 0.96),
+                seed_rng.uniform(0.025, 0.075),
+                seed_rng.uniform(0.018, 0.060),
+                seed_rng.uniform(0.22, 0.58),
+                seed_rng.uniform(0.24, 0.66),
+                seed_rng.uniform(0.0, math.tau),
+                seed_rng.uniform(0.0, math.tau),
+            )
+            for _ in range(34)
+        ]
+        self._caustic_refresh_tick = 0
+        self._caustic_dirty = True
+        self._cached_caustic_size = QSize()
+        self._cached_primary_caustic = QPixmap()
+        self._cached_secondary_caustic = QPixmap()
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._advance)
+        self._timer.stop()
+
+    def _advance(self) -> None:
+        """Drift the caustic light slowly so it feels alive but never distracting."""
+        self._phase = (self._phase + 0.052) % (math.tau * 8.0)
+        self._caustic_refresh_tick = (self._caustic_refresh_tick + 1) % 4096
+        if self._caustic_refresh_tick % 3 == 0:
+            self._caustic_dirty = True
+        if self.isVisible():
+            if self._caustic_dirty:
+                self._refresh_caustic_cache()
+            self.update()
+
+    def resizeEvent(self, event) -> None:
+        """Refresh the cached caustics when the overlay geometry changes."""
+        self._caustic_dirty = True
+        super().resizeEvent(event)
+
+    def showEvent(self, event) -> None:
+        """Prime the caustic cache before the overlay becomes visible."""
+        self._caustic_dirty = True
+        self._refresh_caustic_cache(force=True)
+        if not self._timer.isActive():
+            self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        """Suspend the caustic animation whenever the overlay is hidden."""
+        self._timer.stop()
+        super().hideEvent(event)
+
+    @staticmethod
+    def _smoothstep(edge0: float, edge1: float, value: float) -> float:
+        """Return a smooth 0..1 transition between two edges."""
+        if edge0 == edge1:
+            return 0.0
+        t = max(0.0, min(1.0, (value - edge0) / (edge1 - edge0)))
+        return t * t * (3.0 - 2.0 * t)
+
+    @staticmethod
+    def _ridge(value: float, width: float) -> float:
+        """Return a soft ridge intensity centered around zero."""
+        if width <= 0.0:
+            return 0.0
+        t = max(0.0, 1.0 - abs(value) / width)
+        return t * t
+
+    def _build_caustic_image(self, pixel_width: int, pixel_height: int, phase: float) -> QImage:
+        """Generate an irregular underwater caustic network for the sandy floor."""
+        image = QImage(pixel_width, pixel_height, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor(0, 0, 0, 0))
+        phase *= 1.42
+
+        seed_positions = []
+        for anchor_x, anchor_y, drift_x, drift_y, speed_x, speed_y, phase_x, phase_y in self._caustic_seeds:
+            sx = (
+                anchor_x
+                + math.sin((phase * speed_x) + phase_x) * drift_x * 1.12
+                + math.cos((phase * speed_x * 0.54) - phase_y) * drift_x * 0.34
+            )
+            sy = (
+                anchor_y
+                + math.cos((phase * speed_y) + phase_y) * drift_y * 1.14
+                + math.sin((phase * speed_y * 0.62) - phase_x) * drift_y * 0.32
+            )
+            seed_positions.append((sx, sy))
+
+        for py in range(pixel_height):
+            ny = py / max(1, pixel_height - 1)
+            fade_y = self._smoothstep(0.04, 0.28, ny)
+            bottom_bias = self._smoothstep(0.52, 1.0, ny)
+
+            for px in range(pixel_width):
+                nx = px / max(1, pixel_width - 1)
+
+                sample_x = (
+                    nx
+                    + 0.028 * math.sin((ny * 7.0) + phase * 0.44)
+                    + 0.012 * math.sin((ny * 16.0) - phase * 0.82)
+                )
+                sample_y = (
+                    ny
+                    + 0.022 * math.sin((nx * 6.2) - phase * 0.36)
+                    + 0.010 * math.sin((nx * 15.4) + phase * 0.58)
+                )
+
+                nearest_1 = 1e9
+                nearest_2 = 1e9
+                nearest_3 = 1e9
+                for sx, sy in seed_positions:
+                    dx = sample_x - sx
+                    dy = (sample_y - sy) * 1.18
+                    distance = dx * dx + dy * dy
+                    if distance < nearest_1:
+                        nearest_3 = nearest_2
+                        nearest_2 = nearest_1
+                        nearest_1 = distance
+                    elif distance < nearest_2:
+                        nearest_3 = nearest_2
+                        nearest_2 = distance
+                    elif distance < nearest_3:
+                        nearest_3 = distance
+
+                edge_gap = max(0.0, math.sqrt(nearest_2) - math.sqrt(nearest_1))
+                node_gap = max(0.0, math.sqrt(nearest_3) - math.sqrt(nearest_1))
+                edge = math.exp(-edge_gap * 54.0)
+                node = math.exp(-node_gap * 34.0)
+                shimmer = 0.80 + 0.20 * math.sin((sample_x * 9.4) + (sample_y * 4.1) - phase * 0.46)
+                intensity = (edge * 0.58 + node * 0.11) * shimmer
+
+                envelope_x = 0.82 + 0.18 * math.sin((nx * 2.8) + phase * 0.22)
+                envelope = fade_y * (0.74 + bottom_bias * 0.30) * envelope_x
+                intensity = max(0.0, min(1.0, intensity * envelope))
+
+                if intensity <= 0.02:
+                    continue
+
+                warm_mix = 0.28 + bottom_bias * 0.30
+                red = int(178 + intensity * (44 + 12 * warm_mix))
+                green = int(226 + intensity * (20 + 8 * warm_mix))
+                blue = int(242 + intensity * 10)
+                alpha = int(max(0, min(255, (intensity ** 1.95) * 108)))
+                image.setPixelColor(px, py, QColor(red, green, blue, alpha))
+
+        return image
+
+    def _refresh_caustic_cache(self, force: bool = False) -> None:
+        """Rebuild the heavy caustic textures only when the cache is stale."""
+        if self.width() <= 24 or self.height() <= 24:
+            return
+
+        size = self.size()
+        if (
+            not force
+            and not self._caustic_dirty
+            and self._cached_caustic_size == size
+            and not self._cached_primary_caustic.isNull()
+            and not self._cached_secondary_caustic.isNull()
+        ):
+            return
+
+        phase = self._phase
+        self._cached_primary_caustic = QPixmap.fromImage(
+            self._build_caustic_image(176, 96, phase)
+        )
+        self._cached_secondary_caustic = QPixmap.fromImage(
+            self._build_caustic_image(136, 76, phase + 0.9)
+        )
+        self._cached_caustic_size = QSize(size)
+        self._caustic_dirty = False
+
+    def paintEvent(self, event) -> None:
+        del event
+        if self.width() <= 24 or self.height() <= 24:
+            return
+        if self._cached_primary_caustic.isNull() or self._cached_secondary_caustic.isNull():
+            self._refresh_caustic_cache(force=True)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        clip = QPainterPath()
+        clip.addRoundedRect(
+            0.0,
+            0.0,
+            float(self.width()),
+            float(self.height()),
+            16.0,
+            16.0,
+        )
+        painter.setClipPath(clip)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        width = float(self.width())
+        height = float(self.height())
+        phase = self._phase
+
+        painter.save()
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Screen)
+
+        source_glow = QRadialGradient(
+            width * 0.50,
+            height * 0.08,
+            width * 0.72,
+            width * 0.50,
+            height * 0.05,
+        )
+        source_glow.setColorAt(0.0, QColor(255, 248, 228, 34))
+        source_glow.setColorAt(0.10, QColor(242, 248, 240, 20))
+        source_glow.setColorAt(0.26, QColor(184, 236, 252, 11))
+        source_glow.setColorAt(0.56, QColor(88, 192, 228, 4))
+        source_glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(self.rect(), source_glow)
+
+        surface_haze = QLinearGradient(0.0, 0.0, 0.0, height * 0.68)
+        surface_haze.setColorAt(0.0, QColor(214, 248, 255, 24))
+        surface_haze.setColorAt(0.14, QColor(144, 230, 255, 14))
+        surface_haze.setColorAt(0.42, QColor(68, 164, 210, 8))
+        surface_haze.setColorAt(0.74, QColor(26, 96, 156, 3))
+        surface_haze.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(self.rect(), surface_haze)
+
+        top_sheen = QLinearGradient(0.0, height * 0.13, 0.0, height * 0.26)
+        top_sheen.setColorAt(0.0, QColor(255, 248, 228, 8))
+        top_sheen.setColorAt(0.34, QColor(190, 240, 255, 6))
+        top_sheen.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(QRectF(0.0, height * 0.13, width, height * 0.13), top_sheen)
+
+        sun_patch = QRadialGradient(
+            width * (0.50 + math.sin(phase * 0.10) * 0.015),
+            height * 0.04,
+            width * 0.34,
+            width * 0.50,
+            height * 0.02,
+        )
+        sun_patch.setColorAt(0.0, QColor(255, 249, 228, 22))
+        sun_patch.setColorAt(0.16, QColor(236, 248, 252, 14))
+        sun_patch.setColorAt(0.42, QColor(160, 226, 246, 7))
+        sun_patch.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(self.rect(), sun_patch)
+
+        upper_refract = QLinearGradient(0.0, height * 0.14, width, height * 0.28)
+        upper_refract.setColorAt(0.0, QColor(0, 0, 0, 0))
+        upper_refract.setColorAt(0.24, QColor(192, 240, 255, 3))
+        upper_refract.setColorAt(0.52, QColor(255, 248, 232, 4))
+        upper_refract.setColorAt(0.78, QColor(182, 236, 255, 3))
+        upper_refract.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(QRectF(0.0, height * 0.14, width, height * 0.14), upper_refract)
+
+        shimmer_specs = (
+            (0.28, 0.18, 0.24, 0.06, 9),
+            (0.50, 0.22, 0.28, 0.07, 14),
+            (0.72, 0.28, 0.22, 0.06, 8),
+        )
+        for index, (ax, ay, rx_scale, ry_scale, peak_alpha) in enumerate(shimmer_specs):
+            cx = width * ax + math.sin((phase * 0.36) + index * 1.45) * width * 0.044
+            cy = height * ay + math.cos((phase * 0.26) + index * 0.7) * height * 0.018
+            rx = width * rx_scale
+            ry = height * ry_scale
+            radius = max(rx, ry)
+            pool = QRadialGradient(cx, cy, radius, cx, cy)
+            pool.setColorAt(0.0, QColor(248, 250, 244, peak_alpha))
+            pool.setColorAt(0.18, QColor(172, 238, 255, max(4, int(peak_alpha * 0.6))))
+            pool.setColorAt(0.50, QColor(88, 190, 232, max(2, int(peak_alpha * 0.24))))
+            pool.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.setBrush(pool)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(cx - rx, cy - ry, rx * 2.0, ry * 2.0))
+
+        lower_ambient = QLinearGradient(0.0, height * 0.42, 0.0, height)
+        lower_ambient.setColorAt(0.0, QColor(0, 0, 0, 0))
+        lower_ambient.setColorAt(0.52, QColor(102, 206, 238, 6))
+        lower_ambient.setColorAt(0.82, QColor(142, 226, 246, 9))
+        lower_ambient.setColorAt(1.0, QColor(196, 244, 255, 10))
+        painter.fillRect(QRectF(0.0, height * 0.42, width, height * 0.58), lower_ambient)
+
+        caustic_fade = QLinearGradient(0.0, height * 0.60, 0.0, height)
+        caustic_fade.setColorAt(0.0, QColor(0, 0, 0, 0))
+        caustic_fade.setColorAt(0.36, QColor(140, 234, 252, 8))
+        caustic_fade.setColorAt(1.0, QColor(222, 248, 255, 14))
+        painter.fillRect(QRectF(0.0, height * 0.60, width, height * 0.40), caustic_fade)
+
+        primary_drift_x = math.sin(phase * 0.54) * width * 0.010
+        primary_drift_y = math.cos(phase * 0.46) * height * 0.012
+        primary_scale = 1.0 + math.sin(phase * 0.18) * 0.022
+        caustic_rect = QRectF(
+            (-width * 0.05) + primary_drift_x,
+            (height * 0.55) + primary_drift_y,
+            width * (1.10 * primary_scale),
+            height * (0.52 * primary_scale),
+        )
+        painter.setOpacity(0.96)
+        painter.drawPixmap(caustic_rect.toRect(), self._cached_primary_caustic)
+
+        secondary_drift_x = math.cos((phase * 0.60) + 0.7) * width * 0.012
+        secondary_drift_y = math.sin((phase * 0.50) - 0.5) * height * 0.014
+        secondary_scale = 0.985 + math.cos(phase * 0.16) * 0.018
+        painter.setOpacity(0.34)
+        painter.drawPixmap(
+            QRectF(
+                caustic_rect.x() + width * 0.014 + secondary_drift_x,
+                caustic_rect.y() + height * 0.018 + secondary_drift_y,
+                caustic_rect.width() * secondary_scale,
+                caustic_rect.height() * (secondary_scale * 0.985),
+            ).toRect(),
+            self._cached_secondary_caustic,
+        )
+        painter.setOpacity(1.0)
+
+        sand_glow = QLinearGradient(0.0, height * 0.80, 0.0, height)
+        sand_glow.setColorAt(0.0, QColor(0, 0, 0, 0))
+        sand_glow.setColorAt(0.44, QColor(170, 238, 248, 7))
+        sand_glow.setColorAt(0.84, QColor(225, 248, 244, 9))
+        sand_glow.setColorAt(1.0, QColor(255, 248, 230, 10))
+        painter.fillRect(QRectF(0.0, height * 0.80, width, height * 0.20), sand_glow)
+
+        painter.restore()
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -1144,18 +3219,26 @@ class MainWindow(QMainWindow):
         self.drag_offset = None
         self.developer_mode_enabled = False
         self.dev_preview_compact_mode = False
+        self._launch_intro_active = True
         self._recipient_popup_closed_by_button = False
         self._settings_popup_closed_by_button = False
         self._close_requested_after_stop = False
         self.password_visible = False
         self.title_font_family = ""
         self.loading_gif_path = self._resolve_runtime_loading_asset()
+        self.idle_wallpaper_path = self._resolve_idle_wallpaper_asset()
         self._runtime_loading_opacity = 0.24
         self._runtime_loading_inset = 2
         self._runtime_loading_speed = 100
         self.runtime_loading_watermark = None
         self.runtime_loading_opacity = None
         self.runtime_loading_movie = None
+        self.idle_wallpaper = None
+        self.idle_wallpaper_source = QPixmap(str(self.idle_wallpaper_path))
+        self.idle_wallpaper_opacity = None
+        self.idle_light_overlay = None
+        self.idle_bubble_overlay = None
+        self.bubble_pop_audio = BubblePopAudio(self)
         self.header_color_options = self._load_header_color_options()
         self.header_fill_color = self._load_saved_header_fill_color()
         self.source_mode_options = (
@@ -1174,6 +3257,11 @@ class MainWindow(QMainWindow):
         """Return the one approved runtime loading animation for the app."""
         assets_dir = Path(__file__).resolve().parent.parent / "assets"
         return assets_dir / "surface.gif"
+
+    def _resolve_idle_wallpaper_asset(self) -> Path:
+        """Return the subtle idle wallpaper image for the main screen."""
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        return assets_dir / "idle_wallpaper.png"
 
     def _apply_window_theme(self):
         """Apply the application stylesheet."""
@@ -1201,10 +3289,16 @@ class MainWindow(QMainWindow):
                 border-radius: 18px;
             }
 
+            QFrame#MainAuthCard,
             QFrame#SectionCard {
                 background-color: #101722;
                 border: 1px solid #1d293d;
                 border-radius: 16px;
+            }
+
+            QLabel#IdleWallpaper {
+                background: transparent;
+                border: none;
             }
 
             QLabel#HeroTitle {
@@ -1336,25 +3430,171 @@ class MainWindow(QMainWindow):
                 border: 1px solid #2c698f;
             }
 
+            QFrame#DatePickerPopup {
+                background: transparent;
+                border: none;
+            }
+
+            QFrame#DatePickerPopupShell {
+                background-color: rgba(11, 18, 32, 248);
+                border: 1px solid #2b3d59;
+                border-radius: 16px;
+            }
+
+            QWidget#DatePickerHeader {
+                background-color: transparent;
+                border: none;
+            }
+
+            QPushButton#DatePickerMonthCombo,
+            QPushButton#DatePickerYearCombo {
+                background-color: #13243a;
+                color: #f8fafc;
+                border: 2px solid #3d6287;
+                border-radius: 20px;
+                padding: 0 16px;
+                min-height: 26px;
+                font-size: 12px;
+                font-weight: 700;
+                text-align: left;
+            }
+
+            QPushButton#DatePickerMonthCombo {
+                min-width: 128px;
+            }
+
+            QPushButton#DatePickerYearCombo {
+                min-width: 92px;
+            }
+
+            QPushButton#DatePickerMonthCombo:hover,
+            QPushButton#DatePickerYearCombo:hover {
+                background-color: #18304b;
+                border-color: #4e84b2;
+            }
+
+            QPushButton#DatePickerMonthCombo:pressed,
+            QPushButton#DatePickerYearCombo:pressed {
+                background-color: #1b3551;
+                border-color: #22d3ee;
+            }
+
+            QComboBox#DatePickerMonthCombo::down-arrow,
+            QComboBox#DatePickerYearCombo::down-arrow {
+                image: url("__CHEVRON_ICON_URL__");
+                width: 10px;
+                height: 7px;
+            }
+
+            QLabel#DatePickerTitle {
+                color: #f8fafc;
+                font-size: 13px;
+                font-weight: 700;
+                letter-spacing: 0.3px;
+                padding: 0 4px 2px 4px;
+            }
+
+            QPushButton#DatePickerNavButton {
+                background-color: #0f1827;
+                color: #f8fafc;
+                border: 1px solid #22304a;
+                border-radius: 12px;
+                min-width: 32px;
+                max-width: 32px;
+                min-height: 32px;
+                max-height: 32px;
+                padding: 0px;
+                font-size: 18px;
+                font-weight: 700;
+            }
+
+            QPushButton#DatePickerNavButton:hover {
+                background-color: #152538;
+                border-color: #2c698f;
+            }
+
+            QPushButton#DatePickerNavButton:pressed {
+                background-color: #112638;
+            }
+
+            QCalendarWidget#DatePickerCalendar {
+                background-color: transparent;
+                color: #dbe7f5;
+                border: none;
+            }
+
+            QCalendarWidget#DatePickerCalendar QTableView#qt_calendar_calendarview {
+                background-color: transparent;
+                alternate-background-color: transparent;
+                border: none;
+                outline: 0;
+                margin: 0;
+                padding: 0;
+            }
+
+            QCalendarWidget#DatePickerCalendar QTableView#qt_calendar_calendarview::item {
+                border-radius: 10px;
+                padding: 2px;
+            }
+
+            QCalendarWidget#DatePickerCalendar QTableView#qt_calendar_calendarview::item:hover {
+                background-color: #122437;
+                color: #f8fafc;
+            }
+
+            QCalendarWidget#DatePickerCalendar QTableView#qt_calendar_calendarview::item:selected {
+                background-color: #22d3ee;
+                color: #03131a;
+            }
+
+            QCalendarWidget#DatePickerCalendar QAbstractItemView:enabled {
+                background-color: transparent;
+                color: #dbe7f5;
+                selection-background-color: #22d3ee;
+                selection-color: #03131a;
+                alternate-background-color: transparent;
+                outline: 0;
+                border: none;
+                border-radius: 12px;
+            }
+
+            QCalendarWidget#DatePickerCalendar QAbstractItemView:disabled {
+                color: #5e7088;
+            }
+
+            QCalendarWidget#DatePickerCalendar QHeaderView {
+                background-color: transparent;
+                border: none;
+            }
+
+            QCalendarWidget#DatePickerCalendar QHeaderView::section {
+                background-color: transparent;
+                color: #cbd5e1;
+                border: none;
+                padding: 0 0 8px 0;
+                font-size: 11px;
+                font-weight: 600;
+            }
+
             QListView#DropdownPopupView {
                 background-color: #111b2b;
                 color: #f8fafc;
                 border: 1px solid #325174;
-                border-radius: 14px;
-                padding: 8px 6px;
+                border-radius: 16px;
+                padding: 8px;
                 outline: 0;
             }
 
             QListView#DropdownPopupView::viewport {
                 background-color: #111b2b;
-                border-radius: 12px;
+                border-radius: 14px;
             }
 
             QListView#DropdownPopupView::item {
                 min-height: 32px;
-                margin: 2px;
+                margin: 2px 1px;
                 padding: 0 12px;
-                border-radius: 9px;
+                border-radius: 11px;
             }
 
             QListView#DropdownPopupView::item:hover {
@@ -1367,10 +3607,11 @@ class MainWindow(QMainWindow):
             }
 
             QListView#DropdownPopupView QScrollBar:vertical {
-                background: transparent;
-                width: 10px;
-                margin: 10px 4px 10px 0;
-                border: none;
+                background-color: #0c1422;
+                width: 11px;
+                margin: 10px 2px 10px 2px;
+                border-radius: 6px;
+                border: 1px solid #22304a;
             }
 
             QListView#DropdownPopupView QScrollBar::handle:vertical {
@@ -1389,6 +3630,68 @@ class MainWindow(QMainWindow):
             QListView#DropdownPopupView QScrollBar::sub-page:vertical {
                 background: transparent;
                 height: 0px;
+            }
+
+            QFrame#CalendarHeaderPopup,
+            QFrame#CalendarHeaderPopupPanel {
+                background: transparent;
+                border: none;
+            }
+
+            QFrame#CalendarHeaderPopupPanel {
+                background-color: #111b2b;
+                border: 1px solid #325174;
+                border-radius: 16px;
+            }
+
+            QListWidget#CalendarHeaderList {
+                background-color: transparent;
+                color: #f8fafc;
+                border: none;
+                outline: 0;
+            }
+
+            QListWidget#CalendarHeaderList::item {
+                min-height: 32px;
+                margin: 2px 1px;
+                padding: 0 12px;
+                border-radius: 11px;
+            }
+
+            QListWidget#CalendarHeaderList::item:hover {
+                background-color: #152538;
+            }
+
+            QListWidget#CalendarHeaderList::item:selected {
+                background-color: #17314a;
+                border: 1px solid #2c698f;
+            }
+
+            QListWidget#CalendarHeaderList QScrollBar:vertical {
+                background-color: #0c1422;
+                width: 12px;
+                margin: 8px 0 8px 6px;
+                border-radius: 6px;
+                border: 1px solid #22304a;
+            }
+
+            QListWidget#CalendarHeaderList QScrollBar::handle:vertical {
+                background-color: #315f87;
+                border-radius: 5px;
+                min-height: 34px;
+            }
+
+            QListWidget#CalendarHeaderList QScrollBar::handle:vertical:hover {
+                background-color: #3c7cae;
+            }
+
+            QListWidget#CalendarHeaderList QScrollBar::add-line:vertical,
+            QListWidget#CalendarHeaderList QScrollBar::sub-line:vertical,
+            QListWidget#CalendarHeaderList QScrollBar::add-page:vertical,
+            QListWidget#CalendarHeaderList QScrollBar::sub-page:vertical {
+                background: transparent;
+                height: 0px;
+                border: none;
             }
 
             QFrame#HeaderColorPopup,
@@ -1562,6 +3865,86 @@ class MainWindow(QMainWindow):
             }
 
             QPushButton#CloseTitleBarButton:hover {
+                background-color: #7f1d1d;
+                color: #ffffff;
+                border-color: #991b1b;
+            }
+
+            QDialog#ThemedMessageDialog {
+                background: transparent;
+                border: none;
+            }
+
+            QFrame#DialogShell {
+                background-color: #0e1624;
+                border: 1px solid #22304a;
+                border-radius: 18px;
+            }
+
+            QLabel#DialogTitle {
+                color: #f8fafc;
+                font-size: 15px;
+                font-weight: 700;
+            }
+
+            QLabel#DialogBody {
+                color: #d5e1f0;
+                font-size: 12px;
+                line-height: 1.35em;
+                background: transparent;
+            }
+
+            QFrame#DialogDivider {
+                background-color: #22304a;
+                border: none;
+            }
+
+            QPushButton#DialogPrimaryButton,
+            QPushButton#DialogSecondaryButton,
+            QPushButton#DialogCloseButton {
+                border-radius: 12px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+
+            QPushButton#DialogPrimaryButton {
+                background-color: #22d3ee;
+                color: #03131a;
+                border: 1px solid #22d3ee;
+                padding: 0 14px;
+            }
+
+            QPushButton#DialogPrimaryButton:hover {
+                background-color: #67e8f9;
+                border-color: #67e8f9;
+            }
+
+            QPushButton#DialogSecondaryButton {
+                background-color: #111a28;
+                color: #cbd5e1;
+                border: 1px solid #243248;
+                padding: 0 14px;
+            }
+
+            QPushButton#DialogSecondaryButton:hover {
+                background-color: #162131;
+                color: #f8fafc;
+            }
+
+            QPushButton#DialogCloseButton {
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 28px;
+                max-height: 28px;
+                background-color: transparent;
+                color: #9fb2ca;
+                border: 1px solid transparent;
+                padding: 0;
+                font-size: 17px;
+                font-weight: 800;
+            }
+
+            QPushButton#DialogCloseButton:hover {
                 background-color: #7f1d1d;
                 color: #ffffff;
                 border-color: #991b1b;
@@ -1922,7 +4305,7 @@ class MainWindow(QMainWindow):
         container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
 
         label = QLabel(label_text)
         label.setObjectName("FieldLabel")
@@ -1936,7 +4319,7 @@ class MainWindow(QMainWindow):
 
         return container
 
-    def _create_workflow_divider(self, height: int = 58) -> QFrame:
+    def _create_workflow_divider(self, height: int = 46) -> QFrame:
         """Create a quiet vertical divider between workflow controls."""
         divider = QFrame()
         divider.setObjectName("WorkflowDivider")
@@ -1945,7 +4328,7 @@ class MainWindow(QMainWindow):
         return divider
 
     def _decorate_date_edit(self, date_edit: QDateEdit) -> None:
-        """Add a subtle leading calendar icon inside a date control when supported."""
+        """Add the leading calendar affordance while keeping popup logic custom."""
         line_edit = date_edit.lineEdit()
         if line_edit is None:
             return
@@ -2226,6 +4609,136 @@ class MainWindow(QMainWindow):
         self._apply_card_shadow(card)
         return card
 
+    def _refresh_idle_wallpaper(self) -> None:
+        """Fit the idle wallpaper neatly inside the rounded main card."""
+        auth_card = getattr(self, "auth_card", None)
+        if (
+            self.idle_wallpaper is None
+            or auth_card is None
+            or self.idle_wallpaper_source.isNull()
+        ):
+            return
+
+        card_rect = auth_card.rect()
+        if card_rect.width() <= 0 or card_rect.height() <= 0:
+            return
+
+        target_size = card_rect.size()
+        scaled = self.idle_wallpaper_source.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        offset_x = max(0, (scaled.width() - target_size.width()) // 2)
+        offset_y = max(0, (scaled.height() - target_size.height()) // 2)
+
+        rounded = QPixmap(target_size)
+        rounded.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(rounded)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(
+            0.0,
+            0.0,
+            float(target_size.width()),
+            float(target_size.height()),
+            16.0,
+            16.0,
+        )
+        painter.setClipPath(clip_path)
+        painter.drawPixmap(-offset_x, -offset_y, scaled)
+
+        overlay = QLinearGradient(0, 0, target_size.width(), target_size.height())
+        overlay.setColorAt(0.0, QColor(6, 11, 18, 58))
+        overlay.setColorAt(0.5, QColor(8, 14, 22, 40))
+        overlay.setColorAt(1.0, QColor(5, 10, 17, 52))
+        painter.fillPath(clip_path, overlay)
+
+        cyan_glow = QRadialGradient(
+            target_size.width() * 0.28,
+            target_size.height() * 0.2,
+            target_size.width() * 0.72,
+        )
+        cyan_glow.setColorAt(0.0, QColor(34, 211, 238, 34))
+        cyan_glow.setColorAt(0.4, QColor(34, 211, 238, 12))
+        cyan_glow.setColorAt(1.0, QColor(34, 211, 238, 0))
+        painter.fillRect(rounded.rect(), cyan_glow)
+
+        bottom_lift = QLinearGradient(0, target_size.height() * 0.64, 0, target_size.height())
+        bottom_lift.setColorAt(0.0, QColor(56, 189, 248, 0))
+        bottom_lift.setColorAt(1.0, QColor(56, 189, 248, 18))
+        painter.fillRect(rounded.rect(), bottom_lift)
+
+        magenta_glow = QRadialGradient(
+            target_size.width() * 0.8,
+            target_size.height() * 0.9,
+            target_size.width() * 0.48,
+        )
+        magenta_glow.setColorAt(0.0, QColor(217, 70, 239, 30))
+        magenta_glow.setColorAt(0.45, QColor(217, 70, 239, 10))
+        magenta_glow.setColorAt(1.0, QColor(217, 70, 239, 0))
+        painter.fillRect(rounded.rect(), magenta_glow)
+        painter.end()
+
+        self.idle_wallpaper.setGeometry(card_rect)
+        self.idle_wallpaper.setPixmap(rounded)
+        self.idle_wallpaper.show()
+        self._update_idle_bubble_geometry()
+        self._apply_idle_visual_z_order()
+
+    def _update_idle_light_geometry(self) -> None:
+        """Keep the idle light overlay fitted to the main auth card."""
+        auth_card = getattr(self, "auth_card", None)
+        if self.idle_light_overlay is None or auth_card is None:
+            return
+        self.idle_light_overlay.setGeometry(auth_card.rect())
+
+    def _update_idle_bubble_geometry(self) -> None:
+        """Keep the idle bubble overlay fitted to the main auth card."""
+        auth_card = getattr(self, "auth_card", None)
+        if self.idle_bubble_overlay is None or auth_card is None:
+            return
+        self.idle_bubble_overlay.setGeometry(auth_card.rect())
+
+    def _apply_idle_visual_z_order(self) -> None:
+        """Stack wallpaper, idle bubbles, and interactive controls in a readable order."""
+        if self.idle_wallpaper is not None:
+            self.idle_wallpaper.lower()
+        if self.idle_bubble_overlay is not None and self.idle_bubble_overlay.isVisible():
+            self.idle_bubble_overlay.raise_()
+        if hasattr(self, "title_bar_surface") and self.title_bar_surface is not None:
+            self.title_bar_surface.raise_()
+        if hasattr(self, "header_separator") and self.header_separator is not None:
+            self.header_separator.raise_()
+        if hasattr(self, "auth_body") and self.auth_body is not None:
+            self.auth_body.raise_()
+
+    def _refresh_idle_bubble_visibility(self) -> None:
+        """Show bubbles only while the main idle card is the active surface."""
+        auth_card = getattr(self, "auth_card", None)
+        if self.idle_bubble_overlay is None or auth_card is None:
+            return
+
+        active = (
+            auth_card.isVisible()
+            and self.extraction_thread is None
+            and not self._launch_intro_active
+        )
+        if active:
+            self.idle_bubble_overlay.prime_bubbles()
+            self.idle_bubble_overlay.show()
+            self._apply_idle_visual_z_order()
+        else:
+            self.idle_bubble_overlay.cancel_hold_bubble()
+            self.idle_bubble_overlay.hide()
+
+    def set_launch_intro_active(self, active: bool) -> None:
+        """Pause idle-only animation while the launch intro owns the stage."""
+        self._launch_intro_active = active
+        self._refresh_idle_bubble_visibility()
+
     def _set_status_state(self, state: str, detail: str, tone: str = "ready"):
         """Update the runtime status badge and detail text."""
         palette = {
@@ -2366,8 +4879,102 @@ class MainWindow(QMainWindow):
         """Return True when the simplified runtime panel is the active screen."""
         return self.runtime_card.isVisible() and not self.auth_card.isVisible()
 
+    def _transient_ui_popup_visible(self) -> bool:
+        """Return True while an interactive popup is open so idle bubbles do not steal clicks."""
+        for popup_name in ("recipient_popup", "settings_popup"):
+            popup = getattr(self, popup_name, None)
+            if popup is not None and popup.isVisible():
+                return True
+
+        for date_edit_name in ("irt_start_date_edit", "irt_end_date_edit"):
+            date_edit = getattr(self, date_edit_name, None)
+            if date_edit is None:
+                continue
+
+            calendar_popup = getattr(date_edit, "calendar_popup_widget", None)
+            if calendar_popup is not None and calendar_popup.isVisible():
+                return True
+
+            if calendar_popup is None:
+                continue
+
+            for selector_name in ("month_combo", "year_combo"):
+                selector = getattr(calendar_popup, selector_name, None)
+                header_popup = getattr(selector, "header_popup", None) if selector is not None else None
+                if header_popup is not None and header_popup.isVisible():
+                    return True
+
+        return False
+
+    def _idle_bubble_click_enabled(self) -> bool:
+        """Return True when idle bubbles are visible and can respond to clicks."""
+        return (
+            self.extraction_thread is None
+            and hasattr(self, "auth_card")
+            and self.auth_card.isVisible()
+            and not self._transient_ui_popup_visible()
+            and self.idle_bubble_overlay is not None
+            and self.idle_bubble_overlay.isVisible()
+        )
+
+    def _handle_idle_bubble_pointer_event(self, event) -> bool:
+        """Route idle-background mouse gestures into bubble pops or hold-grow-release bubbles."""
+        if not self._idle_bubble_click_enabled():
+            return False
+
+        overlay = self.idle_bubble_overlay
+        global_pos = event.globalPosition().toPoint()
+        local_pos = overlay.mapFromGlobal(global_pos)
+
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if not overlay.rect().contains(local_pos):
+                return False
+            local_x = float(local_pos.x())
+            local_y = float(local_pos.y())
+            if event.button() == Qt.MouseButton.RightButton:
+                overlay.emit_click_puff(local_x, local_y)
+                return True
+            if overlay.try_pop_at(local_x, local_y):
+                return True
+            return overlay.begin_hold_bubble(local_x, local_y)
+
+        if event.type() == QEvent.Type.MouseMove:
+            return (
+                overlay.has_hold_bubble()
+                and bool(event.buttons() & Qt.MouseButton.LeftButton)
+            )
+
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+            if overlay.has_hold_bubble():
+                overlay.release_hold_bubble()
+                return True
+            return False
+
+        return False
+
     def eventFilter(self, watched, event):
         """Allow the runtime panel itself to drag the window while buttons stay clickable."""
+        if (
+            hasattr(self, "_idle_bubble_click_widgets")
+            and watched in self._idle_bubble_click_widgets
+            and event.type()
+            in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseMove,
+                QEvent.Type.MouseButtonRelease,
+            )
+            and (
+                event.type() == QEvent.Type.MouseMove
+                or getattr(event, "button", lambda: None)()
+                in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton)
+            )
+        ):
+            if self._handle_idle_bubble_pointer_event(event):
+                event.accept()
+                return True
+
         if (
             hasattr(self, "_runtime_drag_widgets")
             and watched in self._runtime_drag_widgets
@@ -2401,6 +5008,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "runtime_window_controls"):
                 self.runtime_window_controls.hide()
             self._refresh_runtime_loading_watermark()
+            self._refresh_idle_bubble_visibility()
             return
 
         self.auth_card.setVisible(not show_runtime)
@@ -2409,6 +5017,7 @@ class MainWindow(QMainWindow):
             self.runtime_window_controls.setVisible(show_runtime)
             self._update_runtime_window_controls_geometry()
         self._refresh_runtime_loading_watermark()
+        self._refresh_idle_bubble_visibility()
 
     def _update_runtime_window_controls_geometry(self) -> None:
         """Keep the floating runtime window controls pinned in the card corner."""
@@ -2504,16 +5113,28 @@ class MainWindow(QMainWindow):
         self.dev_preview_compact_mode = checked
         self._set_runtime_panel_mode(show_runtime=self.extraction_thread is not None)
 
+    def showEvent(self, event):
+        """Refresh layered visuals after the window actually becomes visible."""
+        super().showEvent(event)
+        self._refresh_idle_wallpaper()
+        self._update_idle_bubble_geometry()
+        self._refresh_idle_bubble_visibility()
+        self._update_runtime_window_controls_geometry()
+        self._refresh_runtime_loading_watermark()
+
     def resizeEvent(self, event):
-        """Keep the runtime background animation aligned with the card bounds."""
+        """Keep the idle and runtime background media aligned with their card bounds."""
         super().resizeEvent(event)
+        self._refresh_idle_wallpaper()
+        self._update_idle_bubble_geometry()
+        self._refresh_idle_bubble_visibility()
         self._update_runtime_window_controls_geometry()
         self._refresh_runtime_loading_watermark()
 
     def init_ui(self):
         """Initialize the UI."""
-        self.base_window_size = (590, 618)
-        self.dev_mode_window_size = (590, 618)
+        self.base_window_size = (536, 548)
+        self.dev_mode_window_size = (536, 548)
         self.setWindowTitle("PLR000-CCA001 Extractor")
         self._update_window_size()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
@@ -2526,8 +5147,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout()
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(6)
+        main_layout.setContentsMargins(8, 8, 8, 8)
         central_widget.setLayout(main_layout)
 
         header_card = self._create_card("HeaderCard")
@@ -2542,15 +5163,17 @@ class MainWindow(QMainWindow):
         title.setObjectName("HeroTitle")
         title.setWordWrap(False)
         title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        title.setMinimumHeight(30)
+        title.setMinimumHeight(26)
         title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         if self.title_font_family:
             title_font = QFont(self.title_font_family, 22)
             title_font.setWeight(QFont.Weight.Black)
             title.setFont(title_font)
         title_bar = DraggableTitleBar()
+        self.title_bar_surface = title_bar
         title_bar.setObjectName("TitleBarSurface")
         title_bar.setStyleSheet("background: transparent; border: none;")
+        title_bar.setFixedHeight(44)
         title_bar_layout = QHBoxLayout(title_bar)
         title_bar_layout.setSpacing(8)
         title_bar_layout.setContentsMargins(4, 0, 2, 0)
@@ -2594,6 +5217,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(title_bar)
 
         header_separator = QFrame()
+        self.header_separator = header_separator
         header_separator.setObjectName("HeaderInnerDivider")
         header_separator.setFixedHeight(1)
         header_layout.addWidget(header_separator)
@@ -2608,28 +5232,51 @@ class MainWindow(QMainWindow):
 
         header_card.hide()
 
-        auth_card = self._create_card()
+        auth_card = self._create_card("MainAuthCard")
         self.auth_card = auth_card
+        self.idle_wallpaper = QLabel(auth_card)
+        self.idle_wallpaper.setObjectName("IdleWallpaper")
+        self.idle_wallpaper.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.idle_wallpaper.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+            True,
+        )
+        self.idle_wallpaper.lower()
+        self.idle_wallpaper_opacity = QGraphicsOpacityEffect(self.idle_wallpaper)
+        self.idle_wallpaper_opacity.setOpacity(0.35)
+        self.idle_wallpaper.setGraphicsEffect(self.idle_wallpaper_opacity)
+        if self.idle_wallpaper_source.isNull():
+            self.idle_wallpaper.hide()
+        self.idle_bubble_overlay = BubbleOverlay(auth_card)
+        self.idle_bubble_overlay.setObjectName("IdleBubbleOverlay")
+        self.idle_bubble_overlay.set_pop_audio_callback(self.bubble_pop_audio.play_pop_for_bubble)
+        self.idle_bubble_overlay.hide()
         auth_layout = QVBoxLayout(auth_card)
-        auth_layout.setSpacing(12)
-        auth_layout.setContentsMargins(16, 14, 16, 16)
+        auth_layout.setSpacing(0)
+        auth_layout.setContentsMargins(14, 10, 14, 12)
         auth_layout.addWidget(title_bar)
         auth_layout.addWidget(header_separator)
 
         auth_body = QWidget()
         self.auth_body = auth_body
         auth_body_layout = QVBoxLayout(auth_body)
-        auth_body_layout.setSpacing(12)
-        auth_body_layout.setContentsMargins(0, 0, 0, 0)
+        auth_body_layout.setSpacing(4)
+        auth_body_layout.setContentsMargins(0, 2, 0, 0)
 
-        credentials_layout = QVBoxLayout()
-        credentials_layout.setSpacing(14)
+        credentials_section = QWidget()
+        credentials_section.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        credentials_layout = QVBoxLayout(credentials_section)
+        credentials_layout.setSpacing(2)
+        credentials_layout.setContentsMargins(0, 0, 0, 0)
 
         id_label = QLabel("Lexis ID")
         id_label.setObjectName("FieldLabel")
         self.id_input = QLineEdit()
         self.id_input.setPlaceholderText("Lexis ID")
-        self.id_input.setMinimumHeight(44)
+        self.id_input.setMinimumHeight(40)
         self.id_input.textChanged.connect(self.on_credentials_changed)
         self.id_indicator_action = QAction(self.id_input)
         self.id_indicator_action.setIcon(
@@ -2639,18 +5286,20 @@ class MainWindow(QMainWindow):
             self.id_indicator_action,
             QLineEdit.ActionPosition.TrailingPosition,
         )
-        id_block = QVBoxLayout()
-        id_block.setSpacing(6)
+        id_section = QWidget()
+        id_section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        id_block = QVBoxLayout(id_section)
+        id_block.setSpacing(3)
         id_block.setContentsMargins(0, 0, 0, 0)
         id_block.addWidget(id_label)
         id_block.addWidget(self.id_input)
-        credentials_layout.addLayout(id_block)
+        credentials_layout.addWidget(id_section)
 
         password_label = QLabel("Password")
         password_label.setObjectName("FieldLabel")
         self.password_input = QLineEdit()
         self.password_input.setPlaceholderText("Password")
-        self.password_input.setMinimumHeight(44)
+        self.password_input.setMinimumHeight(40)
         self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_input.textChanged.connect(self.on_credentials_changed)
         self.password_toggle_action = QAction(self.password_input)
@@ -2660,17 +5309,19 @@ class MainWindow(QMainWindow):
             self.password_toggle_action,
             QLineEdit.ActionPosition.TrailingPosition,
         )
-        password_block = QVBoxLayout()
-        password_block.setSpacing(6)
+        password_section = QWidget()
+        password_section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        password_block = QVBoxLayout(password_section)
+        password_block.setSpacing(3)
         password_block.setContentsMargins(0, 0, 0, 0)
         password_block.addWidget(password_label)
         password_block.addWidget(self.password_input)
-        credentials_layout.addLayout(password_block)
+        credentials_layout.addWidget(password_section)
 
-        auth_body_layout.addLayout(credentials_layout)
+        auth_body_layout.addWidget(credentials_section)
 
         self.source_mode_combo = FloatingPopupComboBox()
-        self.source_mode_combo.setMinimumHeight(40)
+        self.source_mode_combo.setMinimumHeight(38)
         self.source_mode_combo.setIconSize(QSize(24, 24))
         self.source_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.source_mode_combo.setSizeAdjustPolicy(
@@ -2686,9 +5337,9 @@ class MainWindow(QMainWindow):
         self.headless_checkbox.setChecked(True)
 
         self.header_color_combo = HeaderColorComboBox()
-        self.header_color_combo.setMinimumHeight(40)
-        self.header_color_combo.setMinimumWidth(168)
-        self.header_color_combo.setMaximumWidth(188)
+        self.header_color_combo.setMinimumHeight(38)
+        self.header_color_combo.setMinimumWidth(160)
+        self.header_color_combo.setMaximumWidth(178)
         self.header_color_combo.setIconSize(QSize(18, 18))
         self.header_color_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
@@ -2723,31 +5374,34 @@ class MainWindow(QMainWindow):
         controls_frame.setObjectName("InlineOptionsCard")
         controls_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controls_outer_layout = QHBoxLayout(controls_frame)
-        controls_outer_layout.setContentsMargins(14, 12, 14, 12)
+        controls_outer_layout.setContentsMargins(10, 7, 10, 7)
         controls_outer_layout.setSpacing(0)
 
         controls_inner = QWidget()
-        controls_inner.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        controls_inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controls_layout = QGridLayout(controls_inner)
         controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setHorizontalSpacing(12)
-        controls_layout.setVerticalSpacing(6)
+        controls_layout.setHorizontalSpacing(8)
+        controls_layout.setVerticalSpacing(4)
 
         source_label = QLabel("Source")
         source_label.setObjectName("FieldLabel")
+        source_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
         controls_layout.addWidget(source_label, 0, 0)
 
         recipients_label = QLabel("Recipients")
         recipients_label.setObjectName("FieldLabel")
+        recipients_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
         controls_layout.addWidget(recipients_label, 0, 1)
 
         source_selector_row = QWidget()
+        source_selector_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         source_selector_layout = QHBoxLayout(source_selector_row)
         source_selector_layout.setContentsMargins(0, 0, 0, 0)
-        source_selector_layout.setSpacing(6)
+        source_selector_layout.setSpacing(5)
         source_selector_layout.addWidget(self.source_mode_combo, 1)
-        self.source_mode_combo.setMinimumWidth(154)
-        self.source_mode_combo.setMaximumWidth(192)
+        self.source_mode_combo.setMinimumWidth(146)
+        self.source_mode_combo.setMaximumWidth(186)
 
         self.source_template_btn = QPushButton("+")
         self.source_template_btn.setObjectName("SquareAccentButton")
@@ -2761,8 +5415,8 @@ class MainWindow(QMainWindow):
         self.recipients_toggle_btn = QPushButton("Recipients")
         self.recipients_toggle_btn.setObjectName("InlineToggleButton")
         self.recipients_toggle_btn.setCheckable(True)
-        self.recipients_toggle_btn.setMinimumHeight(40)
-        self.recipients_toggle_btn.setMinimumWidth(136)
+        self.recipients_toggle_btn.setMinimumHeight(38)
+        self.recipients_toggle_btn.setMinimumWidth(130)
         self.recipients_toggle_btn.setMaximumWidth(146)
         self.recipients_toggle_btn.setIcon(
             self._load_colored_icon("recipients", "#cbd5e1", 24, vertical_offset=1)
@@ -2777,9 +5431,9 @@ class MainWindow(QMainWindow):
         self.settings_toggle_btn = QPushButton("Settings")
         self.settings_toggle_btn.setObjectName("InlineToggleButton")
         self.settings_toggle_btn.setCheckable(True)
-        self.settings_toggle_btn.setMinimumHeight(54)
-        self.settings_toggle_btn.setMinimumWidth(102)
-        self.settings_toggle_btn.setMaximumWidth(108)
+        self.settings_toggle_btn.setMinimumHeight(50)
+        self.settings_toggle_btn.setMinimumWidth(94)
+        self.settings_toggle_btn.setMaximumWidth(100)
         self.settings_toggle_btn.setIcon(
             self._load_colored_icon("settings", "#67e8f9", 24, vertical_offset=1)
         )
@@ -2809,40 +5463,40 @@ class MainWindow(QMainWindow):
         )
         irt_filters_outer_layout = QHBoxLayout(self.irt_filters_frame)
         irt_filters_outer_layout.setSpacing(0)
-        irt_filters_outer_layout.setContentsMargins(14, 12, 14, 12)
+        irt_filters_outer_layout.setContentsMargins(10, 5, 10, 5)
 
         irt_filters_inner = QWidget()
         irt_filters_inner.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         irt_filters_layout = QHBoxLayout(irt_filters_inner)
-        irt_filters_layout.setSpacing(12)
+        irt_filters_layout.setSpacing(8)
         irt_filters_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.irt_start_date_edit = QDateEdit()
-        self.irt_start_date_edit.setCalendarPopup(True)
+        self.irt_start_date_edit = ThemedDateEdit()
         self.irt_start_date_edit.setDisplayFormat("M/d/yyyy")
-        self.irt_start_date_edit.setMinimumHeight(40)
+        self.irt_start_date_edit.setMinimumHeight(38)
         self._decorate_date_edit(self.irt_start_date_edit)
         self.irt_start_field = self._create_workflow_field(
             "From",
             self.irt_start_date_edit,
-            182,
+            176,
             194,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
         )
         irt_filters_layout.addWidget(self.irt_start_field, 1)
 
         self.workflow_divider_dates = self._create_workflow_divider()
         irt_filters_layout.addWidget(self.workflow_divider_dates)
 
-        self.irt_end_date_edit = QDateEdit()
-        self.irt_end_date_edit.setCalendarPopup(True)
+        self.irt_end_date_edit = ThemedDateEdit()
         self.irt_end_date_edit.setDisplayFormat("M/d/yyyy")
-        self.irt_end_date_edit.setMinimumHeight(40)
+        self.irt_end_date_edit.setMinimumHeight(38)
         self._decorate_date_edit(self.irt_end_date_edit)
         self.irt_end_field = self._create_workflow_field(
             "To",
             self.irt_end_date_edit,
-            182,
+            176,
             194,
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
         )
         irt_filters_layout.addWidget(self.irt_end_field, 1)
 
@@ -2868,14 +5522,14 @@ class MainWindow(QMainWindow):
         auth_body_layout.addWidget(actions_divider)
 
         buttons_layout = QHBoxLayout()
-        buttons_layout.setSpacing(10)
-        buttons_layout.setContentsMargins(0, 4, 0, 0)
+        buttons_layout.setSpacing(8)
+        buttons_layout.setContentsMargins(4, 0, 4, 0)
 
-        self.view_folder_btn = QPushButton("Open Results")
+        self.view_folder_btn = QPushButton("View Folder")
         self.view_folder_btn.setObjectName("GhostButton")
-        self.view_folder_btn.setMinimumHeight(44)
-        self.view_folder_btn.setMinimumWidth(152)
-        self.view_folder_btn.setMaximumWidth(164)
+        self.view_folder_btn.setMinimumHeight(42)
+        self.view_folder_btn.setMinimumWidth(142)
+        self.view_folder_btn.setMaximumWidth(152)
         self.view_folder_btn.setIcon(
             self._load_colored_icon("results_folder", "#9fb2ca", 22, vertical_offset=1)
         )
@@ -2887,9 +5541,9 @@ class MainWindow(QMainWindow):
 
         self.extract_btn = QPushButton("Run Extraction")
         self.extract_btn.setObjectName("PrimaryButton")
-        self.extract_btn.setMinimumHeight(46)
-        self.extract_btn.setMinimumWidth(194)
-        self.extract_btn.setMaximumWidth(206)
+        self.extract_btn.setMinimumHeight(44)
+        self.extract_btn.setMinimumWidth(180)
+        self.extract_btn.setMaximumWidth(190)
         self.extract_btn.setIcon(self._load_colored_icon("play", "#ffffff", 28, vertical_offset=1))
         self.extract_btn.setIconSize(QSize(28, 28))
         self.extract_btn.setEnabled(False)
@@ -2898,8 +5552,32 @@ class MainWindow(QMainWindow):
 
         auth_body_layout.addLayout(buttons_layout)
         auth_layout.addWidget(auth_body)
+        self._idle_bubble_click_widgets = tuple(
+            widget
+            for widget in auth_card.findChildren(QWidget)
+            if widget is not self.title_bar_surface
+            and not self.title_bar_surface.isAncestorOf(widget)
+            if not isinstance(
+                widget,
+                (
+                    QLineEdit,
+                    QPushButton,
+                    QComboBox,
+                    QDateEdit,
+                    QCheckBox,
+                    QToolButton,
+                    QPlainTextEdit,
+                    QListWidget,
+                    QListView,
+                    QCalendarWidget,
+                ),
+            )
+        ) + (auth_card,)
+        for bubble_click_widget in self._idle_bubble_click_widgets:
+            bubble_click_widget.installEventFilter(self)
 
         main_layout.addWidget(auth_card)
+        self._refresh_idle_wallpaper()
 
         runtime_card = self._create_card()
         self.runtime_card = runtime_card
@@ -3069,15 +5747,12 @@ class MainWindow(QMainWindow):
             )
             excel_handler.open_file(template_path)
 
-            QMessageBox.information(
-                self,
-                "Template Generated",
+            self._show_success_dialog(
+                "Template ready",
                 (
-                    "Manual reference template created successfully!\n\n"
-                    f"File location:\n{template_path}\n\n"
-                    "The file has been opened for you.\n\n"
-                    "If you want Run Extraction to use this workbook,\n"
-                    "switch Source to Template after you finish editing it."
+                    "Opened and ready to edit.\n\n"
+                    f"Location:\n{template_path}\n\n"
+                    "When you're done, switch Source to Template before running extraction."
                 ),
             )
 
@@ -3087,10 +5762,9 @@ class MainWindow(QMainWindow):
                 f"Failed to generate template: {e}",
                 "error",
             )
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Failed to generate template:\n{e}",
+            self._show_error_dialog(
+                "Couldn't create template",
+                f"Something went wrong while creating the template.\n\n{e}",
             )
 
     def view_output_folder(self):
@@ -3106,10 +5780,9 @@ class MainWindow(QMainWindow):
                     "ready",
                 )
             else:
-                QMessageBox.warning(
-                    self,
-                    "Error",
-                    "Failed to open results folder. Please navigate to:\n"
+                self._show_warning_dialog(
+                    "Couldn't open results folder",
+                    "Open it manually here:\n"
                     + str(file_manager.get_results_folder()),
                 )
         except Exception as e:
@@ -3118,10 +5791,9 @@ class MainWindow(QMainWindow):
                 f"Failed to open folder: {e}",
                 "error",
             )
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Failed to open folder:\n{e}",
+            self._show_error_dialog(
+                "Couldn't open folder",
+                f"Try opening the results folder manually.\n\n{e}",
             )
 
     def stop_extraction(self):
@@ -3132,11 +5804,11 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.setText("Stopping...")
         self.progress_meta_label.setText(
-            "Stop requested. Finishing the current step and saving partial progress."
+            "Stopping after the current step. Saving any progress so far."
         )
         self._set_status_state(
             "Stopping",
-            "Finishing the current step, saving partial progress, and closing the run...",
+            "Stopping after the current step and saving progress...",
             "warning",
         )
         self.extraction_thread.request_stop()
@@ -3151,17 +5823,15 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
-        response = QMessageBox.question(
-            self,
-            "Stop Run And Close?",
+        if self._confirm_dialog(
+            "Stop this run?",
             (
                 "A run is still active.\n\n"
-                "Do you want to stop the run, save partial progress, and close the window once it is safe?"
+                "Stop it, save any progress so far, and close the window when it's safe?"
             ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if response == QMessageBox.StandardButton.Yes:
+            tone="warning",
+            default_button="no",
+        ):
             self._close_requested_after_stop = True
             if self.stop_btn.isEnabled():
                 self.stop_extraction()
@@ -3169,6 +5839,62 @@ class MainWindow(QMainWindow):
             return
 
         event.ignore()
+
+    def _show_themed_dialog(
+        self,
+        title: str,
+        message: str,
+        tone: str = "info",
+        buttons: tuple[str, ...] = ("ok",),
+        default_button: str = "ok",
+    ) -> str:
+        """Show a custom in-theme modal dialog and return the selected button key."""
+        dialog = ThemedMessageDialog(
+            parent=self,
+            title=title,
+            message=message,
+            tone=tone,
+            buttons=buttons,
+            default_button=default_button,
+            title_font_family=self.title_font_family,
+        )
+        dialog.exec()
+        return dialog.choice
+
+    def _show_info_dialog(self, title: str, message: str) -> None:
+        """Show an informational dialog styled to match the app."""
+        self._show_themed_dialog(title, message, tone="info", buttons=("ok",))
+
+    def _show_success_dialog(self, title: str, message: str) -> None:
+        """Show a success dialog styled to match the app."""
+        self._show_themed_dialog(title, message, tone="success", buttons=("ok",))
+
+    def _show_warning_dialog(self, title: str, message: str) -> None:
+        """Show a warning dialog styled to match the app."""
+        self._show_themed_dialog(title, message, tone="warning", buttons=("ok",))
+
+    def _show_error_dialog(self, title: str, message: str) -> None:
+        """Show an error dialog styled to match the app."""
+        self._show_themed_dialog(title, message, tone="error", buttons=("ok",))
+
+    def _confirm_dialog(
+        self,
+        title: str,
+        message: str,
+        tone: str = "question",
+        default_button: str = "no",
+    ) -> bool:
+        """Show a themed Yes/No prompt and return True when the user confirms."""
+        return (
+            self._show_themed_dialog(
+                title,
+                message,
+                tone=tone,
+                buttons=("yes", "no"),
+                default_button=default_button,
+            )
+            == "yes"
+        )
 
     def start_extraction(self):
         """Start the extraction process."""
@@ -3179,10 +5905,9 @@ class MainWindow(QMainWindow):
         password = self.password_input.text()
 
         if not user_id or not password:
-            QMessageBox.warning(
-                self,
-                "Missing Credentials",
-                "Please enter both ID and Password.",
+            self._show_warning_dialog(
+                "Add your credentials",
+                "Enter your Lexis ID and password to continue.",
             )
             return
 
@@ -3190,18 +5915,16 @@ class MainWindow(QMainWindow):
         recipient_cc = self.recipient_cc_input.toPlainText().strip()
 
         if (recipient_to or recipient_cc) and not recipient_to:
-            QMessageBox.warning(
-                self,
-                "Recipients",
-                "Enter at least one To recipient when using the manual Recipients override.",
+            self._show_warning_dialog(
+                "Add a To recipient",
+                "Enter at least one To recipient before using a manual recipient override.",
             )
             return
 
         if self.developer_mode_enabled and not recipient_to:
-            QMessageBox.warning(
-                self,
-                "Developer Mode",
-                "Enter at least one To recipient in Recipients before running the test send.",
+            self._show_warning_dialog(
+                "Add a test recipient",
+                "In Developer Mode, add at least one To recipient before sending a test run.",
             )
             return
 
@@ -3216,28 +5939,25 @@ class MainWindow(QMainWindow):
             irt_start_date = self.irt_start_date_edit.date().toPyDate()
             irt_end_date = self.irt_end_date_edit.date().toPyDate()
             if irt_start_date > irt_end_date:
-                QMessageBox.warning(
-                    self,
-                    "IRT Date Range",
-                    "The IRT start date must be on or before the end date.",
+                self._show_warning_dialog(
+                    "Check the date range",
+                    "The From date must be on or before the To date.",
                 )
                 return
 
         if source_mode == "manual":
             excel_path = file_manager.find_most_recent_excel_file()
             if excel_path is None:
-                QMessageBox.warning(
-                    self,
-                    "No Manual Workbook Found",
-                    "Please generate and fill out a Template first, then close the file before running extraction.",
+                self._show_warning_dialog(
+                    "Template not found",
+                    "Create and fill out a Template first, then close it before running extraction.",
                 )
                 return
 
             if file_manager.is_file_locked(excel_path):
-                QMessageBox.warning(
-                    self,
-                    "Manual Workbook Is Open",
-                    "Please close the manual workbook first, then click Run Extraction again.",
+                self._show_warning_dialog(
+                    "Close the template first",
+                    "Close the template workbook, then run extraction again.",
                 )
                 return
 
@@ -3374,22 +6094,14 @@ class MainWindow(QMainWindow):
 
         if success:
             self._set_status_state("Completed", message, "success")
-            QMessageBox.information(
-                self,
-                "Lexis Cite Extraction Successful!",
-                message,
-            )
+            self._show_success_dialog("Extraction complete", message)
             self.open_output_file(output_path)
         else:
             self._set_status_state("Issue", message, "error")
-            QMessageBox.critical(
-                self,
-                "Extraction Failed",
-                message,
-            )
+            self._show_error_dialog("Extraction couldn't finish", message)
 
-        self.reset_ui()
         self.extraction_thread = None
+        self.reset_ui()
         if self._close_requested_after_stop:
             self._close_requested_after_stop = False
             QTimer.singleShot(0, self.close)
@@ -3398,13 +6110,9 @@ class MainWindow(QMainWindow):
         """Handle a user-requested stop without treating it like a crash."""
         self.progress_bar.setValue(0)
         self._set_status_state("Stopped", message, "warning")
-        QMessageBox.information(
-            self,
-            "Run Stopped",
-            message,
-        )
-        self.reset_ui()
+        self._show_info_dialog("Run stopped", message)
         self.extraction_thread = None
+        self.reset_ui()
         if self._close_requested_after_stop:
             self._close_requested_after_stop = False
             QTimer.singleShot(0, self.close)
@@ -3416,10 +6124,9 @@ class MainWindow(QMainWindow):
 
         path = Path(output_path)
         if not path.exists():
-            QMessageBox.warning(
-                self,
-                "Output File Not Found",
-                f"The extraction finished, but the output file could not be found:\n{path}",
+            self._show_warning_dialog(
+                "Output file not found",
+                f"The run finished, but the output file wasn't found:\n{path}",
             )
             return
 
@@ -3429,8 +6136,7 @@ class MainWindow(QMainWindow):
             excel_handler = ExcelHandler()
             excel_handler.open_file(path)
         except Exception as e:
-            QMessageBox.warning(
-                self,
-                "Could Not Open Output File",
-                f"The extraction finished, but the output file could not be opened:\n{e}",
+            self._show_warning_dialog(
+                "Couldn't open the file",
+                f"Excel couldn't open the results file:\n{e}",
             )
