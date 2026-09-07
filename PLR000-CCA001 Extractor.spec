@@ -6,6 +6,7 @@ datas = [('assets', 'assets')]
 binaries = []
 hiddenimports = ['pythoncom', 'pywintypes', 'win32timezone']
 hiddenimports += collect_submodules('win32com')
+hiddenimports += collect_submodules('PyQt6.QtMultimedia')
 tmp_ret = collect_all('keyring')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

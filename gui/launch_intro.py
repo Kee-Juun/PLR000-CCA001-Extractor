@@ -261,13 +261,29 @@ class LaunchIntroOverlay(QWidget):
         self._timer.stop()
         if self._motion_movie is not None:
             self._motion_movie.stop()
-        self.target_window.setWindowOpacity(1.0)
-        self.target_window.move(self.target_rect_global.topLeft())
-        self.target_window.raise_()
-        self.target_window.activateWindow()
         self.hide()
+        self._restore_target_window()
+        # Windows can defer activation until the always-on-top overlay has
+        # actually left the stacking order, so reinforce it on the next turn.
+        QTimer.singleShot(0, self._restore_target_window)
         self.finished.emit()
         self.deleteLater()
+
+    def _restore_target_window(self) -> None:
+        """Return the main window to an active normal state after the intro."""
+        target = self.target_window
+        if target is None:
+            return
+
+        target.setWindowState(
+            target.windowState() & ~Qt.WindowState.WindowMinimized
+        )
+        target.setGeometry(self.target_rect_global)
+        target.setWindowOpacity(1.0)
+        target.showNormal()
+        target.show()
+        target.raise_()
+        target.activateWindow()
 
     def _phase_progress(
         self,

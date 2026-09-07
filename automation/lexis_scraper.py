@@ -45,9 +45,9 @@ class LexisScraper:
 
     # Login selectors
     USERID_FIELD = "//*[@id='userid']"
-    SIGNIN_BUTTON = "//*[@id='signInSbmtBtn']"
+    SIGNIN_BUTTON = "//*[@id='next']"
     PASSWORD_FIELD = "//*[@id='password']"
-    NEXT_BUTTON = "//*[@id='next']"
+    NEXT_BUTTON = "//*[@id='signInSbmtBtn']"
 
     # Search/document selectors
     SEARCH_TERMS_FIELD = "//*[@id='searchTerms']"
@@ -489,13 +489,27 @@ class LexisScraper:
             userid_field.send_keys(user_id)
             self._log("User ID entered")
 
-            if not self.safe_click(self.SIGNIN_BUTTON, timeout=15, retries=2):
-                self._log("Sign In button not clickable")
+            if not self.safe_click(
+                self.NEXT_BUTTON,
+                timeout=15,
+                retries=2,
+                allow_js_fallback=True,
+            ):
+                self._log("Next button not clickable after entering User ID")
                 return LoginResult(
                     success=False,
                     reason=self.LOGIN_REASON_SUBMIT_BUTTON_NOT_CLICKABLE,
-                    message="Could not click the Sign In button.",
+                    message="Could not click the Next button after entering the User ID.",
                 )
+
+            self._log("Clicked Next button")
+            try:
+                self._until(
+                    lambda _driver: driver.execute_script("return document.readyState") == "complete",
+                    timeout=15,
+                )
+            except TimeoutException:
+                self._log("Password step document.readyState did not reach 'complete' before timeout")
 
             password_field = self._until(
                 EC.visibility_of_element_located((By.XPATH, self.PASSWORD_FIELD))
@@ -504,14 +518,20 @@ class LexisScraper:
             password_field.send_keys(password)
             self._log("Password entered")
 
-            if not self.safe_click(self.NEXT_BUTTON, timeout=15, retries=2):
-                self._log("Next/Sign In button not clickable")
+            if not self.safe_click(
+                self.SIGNIN_BUTTON,
+                timeout=15,
+                retries=2,
+                allow_js_fallback=True,
+            ):
+                self._log("Sign In button not clickable after entering password")
                 return LoginResult(
                     success=False,
                     reason=self.LOGIN_REASON_SUBMIT_BUTTON_NOT_CLICKABLE,
-                    message="Could not click the Next/Sign In button.",
+                    message="Could not click the Sign In button after entering the password.",
                 )
 
+            self._log("Clicked Sign In button")
             try:
                 self._until(
                     EC.presence_of_element_located((By.XPATH, self.SEARCH_TERMS_FIELD)),

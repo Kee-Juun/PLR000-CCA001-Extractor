@@ -68,6 +68,7 @@ from PyQt6.QtWidgets import (
 )
 
 from config.app_settings import (
+    AUDIT_MODE_KEY,
     HEADER_FILL_COLOR_KEY,
     RECIPIENT_OVERRIDE_CC_KEY,
     RECIPIENT_OVERRIDE_TO_KEY,
@@ -91,32 +92,89 @@ class AnimatedProgressBar(QProgressBar):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sheen_position = 0
+        self._indeterminate = False
+        self._marquee_width = 148
+        self._marquee_position = -self._marquee_width
         self.animation_timer = QTimer(self)
         self.animation_timer.timeout.connect(self.update_sheen)
         self.animation_timer.start(20)
 
+    def set_indeterminate(self, active: bool) -> None:
+        """Toggle marquee mode for stages that don't have measurable percent progress yet."""
+        if self._indeterminate == active:
+            return
+        self._indeterminate = active
+        self.sheen_position = 0
+        self._marquee_position = -self._marquee_width
+        self.update()
+
+    def is_indeterminate(self) -> bool:
+        """Return whether the bar is currently showing a marquee state."""
+        return self._indeterminate
+
     def update_sheen(self):
         """Update the sheen animation position."""
-        if self.maximum() > 0 and self.value() > 0:
+        if self._indeterminate:
+            travel_span = max(self.width() + (self._marquee_width * 2), self._marquee_width * 2)
+            self._marquee_position = (
+                (self._marquee_position + 7 + self._marquee_width) % travel_span
+            ) - self._marquee_width
+        elif self.maximum() > 0 and self.value() > 0:
             progress_width = int((self.value() / self.maximum()) * self.width())
             max_position = max(progress_width + 100, 200)
             self.sheen_position = (self.sheen_position + 5) % max_position
         else:
             self.sheen_position = 0
+            self._marquee_position = -self._marquee_width
         self.update()
 
     def paintEvent(self, event):
         """Custom paint event for sheen animation."""
         super().paintEvent(event)
 
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bar_rect = self.rect().adjusted(0, 0, -1, -1)
+        if bar_rect.width() <= 0 or bar_rect.height() <= 0:
+            return
+
+        radius = max(1.0, bar_rect.height() / 2)
+        clip_path = QPainterPath()
+        clip_path.addRoundedRect(QRectF(bar_rect), radius, radius)
+        painter.setClipPath(clip_path)
+
+        if self._indeterminate:
+            shimmer_gradient = QLinearGradient(
+                self._marquee_position,
+                0,
+                self._marquee_position + self._marquee_width,
+                0,
+            )
+            shimmer_gradient.setColorAt(0.0, QColor(34, 211, 238, 0))
+            shimmer_gradient.setColorAt(0.18, QColor(34, 211, 238, 36))
+            shimmer_gradient.setColorAt(0.5, QColor(125, 211, 252, 180))
+            shimmer_gradient.setColorAt(0.82, QColor(37, 99, 235, 92))
+            shimmer_gradient.setColorAt(1.0, QColor(37, 99, 235, 0))
+
+            painter.fillRect(bar_rect, shimmer_gradient)
+
+            highlight_gradient = QLinearGradient(
+                self._marquee_position - 34,
+                0,
+                self._marquee_position + self._marquee_width - 18,
+                0,
+            )
+            highlight_gradient.setColorAt(0.0, QColor(255, 255, 255, 0))
+            highlight_gradient.setColorAt(0.5, QColor(255, 255, 255, 56))
+            highlight_gradient.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillRect(bar_rect, highlight_gradient)
+            return
+
         if self.value() > 0 and self.maximum() > 0:
             progress_ratio = self.value() / self.maximum()
             progress_width = int(progress_ratio * self.width())
 
             if progress_width > 0:
-                painter = QPainter(self)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
                 filled_rect = self.rect()
                 filled_rect.setWidth(progress_width)
 
@@ -1051,6 +1109,7 @@ class ExtractionThread(QThread):
         manual_override_cc: str = "",
         header_fill_color: str = "",
         source_mode: str = "irt",
+        audit_mode: str = "both",
         irt_court_scope: str = "both",
         irt_start_date: date | None = None,
         irt_end_date: date | None = None,
@@ -1071,11 +1130,13 @@ class ExtractionThread(QThread):
         self.manual_override_cc = manual_override_cc
         self.header_fill_color = header_fill_color
         self.source_mode = source_mode
+        self.audit_mode = audit_mode
         self.irt_court_scope = irt_court_scope
         self.irt_start_date = irt_start_date
         self.irt_end_date = irt_end_date
         self.outlook_import_summary = None
         self._stop_requested = False
+        self._terminal_report_sent = False
 
     def request_stop(self) -> None:
         """Request a cooperative stop for the active run."""
@@ -1094,6 +1155,78 @@ class ExtractionThread(QThread):
         """Abort promptly when a stop request is active."""
         if self._is_stop_requested():
             raise InterruptedError("Stopped.")
+
+    def _get_log_file_path(self) -> Path | None:
+        """Return the current log file path when available."""
+        if self.logger and hasattr(self.logger, "get_log_file_path"):
+            try:
+                return self.logger.get_log_file_path()
+            except Exception:
+                return None
+        return None
+
+    def _save_log_quietly(self) -> None:
+        """Persist the current run log without raising new terminal errors."""
+        if not self.logger:
+            return
+        try:
+            self.logger.log("Saving log file")
+            self.logger.save_log()
+        except Exception as e:
+            try:
+                self.logger.log(f"Error saving log file: {e}\n{traceback.format_exc()}")
+            except Exception:
+                pass
+
+    def _send_terminal_report(self, status: str, message: str, output_path=None) -> None:
+        """Send one automated status email for the current run."""
+        if self._terminal_report_sent:
+            return
+
+        self._terminal_report_sent = True
+        try:
+            from utils.run_status_reporter import send_run_status_report
+
+            effective_override_to = self.manual_override_to or (
+                self.developer_override_to if self.developer_mode_enabled else ""
+            )
+            effective_override_cc = (
+                self.manual_override_cc
+                if self.manual_override_to
+                else (self.developer_override_cc if self.developer_mode_enabled else "")
+            )
+
+            send_run_status_report(
+                status=status,
+                message=message,
+                run_folder=self.run_folder,
+                workbook_path=output_path or self.excel_path,
+                log_file_path=self._get_log_file_path(),
+                user_id=self.user_id,
+                source_mode=self.source_mode,
+                headless_mode=self.headless_mode,
+                developer_mode_enabled=self.developer_mode_enabled,
+                recipient_override_to=effective_override_to,
+                recipient_override_cc=effective_override_cc,
+                logger=self.logger,
+            )
+        except Exception as e:
+            if self.logger:
+                self.logger.log(
+                    f"Run status report helper failed: {e}\n{traceback.format_exc()}"
+                )
+
+    def _emit_finished_state(self, success: bool, message: str, output_path) -> None:
+        """Persist the log, send the status report, and emit the finished signal."""
+        self._save_log_quietly()
+        self._send_terminal_report("success" if success else "failure", message, output_path)
+        self.finished.emit(success, message, output_path)
+
+    def _emit_cancelled_state(self, message: str, output_path) -> None:
+        """Persist the log, send the status report, and emit the cancelled signal."""
+        self._save_log_quietly()
+        self._send_terminal_report("cancelled", message, output_path)
+        self.cancelled.emit(message, output_path)
 
     def _finalize_cancellation(self, excel_handler=None) -> None:
         """Save partial work when possible and emit a calm cancelled state."""
@@ -1118,14 +1251,40 @@ class ExtractionThread(QThread):
                     )
                 message = "Progress so far couldn't be saved automatically."
 
-        if self.logger:
-            try:
-                self.logger.log("Saving log file")
-                self.logger.save_log()
-            except Exception:
-                pass
+        self._emit_cancelled_state(message, output_path)
 
-        self.cancelled.emit(message, output_path)
+    def _is_precheck_only_run(self) -> bool:
+        """Return True when the run should show pre-check as a busy stage only."""
+        return self.source_mode == "irt" and self.audit_mode == "pre"
+
+    def _is_combined_check_run(self) -> bool:
+        """Return True when pre-check should occupy the first progress slice."""
+        return self.source_mode == "irt" and self.audit_mode == "both"
+
+    def _emit_progress_update(self, percentage: int, status: str) -> None:
+        """Emit a clamped determinate progress update."""
+        self.progress_update.emit(max(0, min(100, percentage)), status)
+
+    def _emit_precheck_progress(self, milestone: int, status: str) -> None:
+        """Emit pre-check progress as marquee-only or within the reserved front slice."""
+        if self._is_precheck_only_run():
+            self.progress_update.emit(-1, status)
+            return
+
+        if self._is_combined_check_run():
+            self._emit_progress_update(min(max(milestone, 0), 20), status)
+            return
+
+        self._emit_progress_update(0, status)
+
+    def _emit_extraction_progress(self, raw_percentage: int, status: str) -> None:
+        """Emit extraction progress, remapping it when pre-check already used the front slice."""
+        if self._is_combined_check_run():
+            mapped = 20 + round(max(0, min(100, raw_percentage)) * 0.8)
+            self._emit_progress_update(max(20, min(100, mapped)), status)
+            return
+
+        self._emit_progress_update(raw_percentage, status)
 
     def _search_current_lni(self, scraper, lni: str, is_first_search: bool) -> tuple[bool, bool]:
         """Start or restart the search flow for the current LNI."""
@@ -1162,7 +1321,7 @@ class ExtractionThread(QThread):
                 retry_status = (
                     f"Retrying LNI {processed}/{total_lnis} after temporary result-load issue..."
                 )
-                self.progress_update.emit(progress, retry_status)
+                self._emit_extraction_progress(progress, retry_status)
                 self.logger.log(
                     f"Retrying LNI {lni} (attempt {attempt}/{self.MAX_LNI_ATTEMPTS}) "
                     f"because {last_failure_detail}."
@@ -1238,7 +1397,7 @@ class ExtractionThread(QThread):
                         if self.irt_start_date is None or self.irt_end_date is None:
                             raise RuntimeError("IRT date filters were not provided.")
 
-                        self.progress_update.emit(0, "Importing source data from IRT...")
+                        self._emit_precheck_progress(4, "Importing source data from IRT...")
                         self.logger.log("Importing source data from IRT Search Inventory")
                         import_summary = import_irt_results_to_workbook(
                             run_folder=self.run_folder,
@@ -1253,8 +1412,8 @@ class ExtractionThread(QThread):
                             cancel_check=self._is_stop_requested,
                         )
                         self.excel_path = import_summary.workbook_path
-                        self.progress_update.emit(
-                            0,
+                        self._emit_precheck_progress(
+                            10,
                             f"Imported {import_summary.imported_row_count} row(s) from IRT results",
                         )
                         self.logger.log(
@@ -1266,7 +1425,7 @@ class ExtractionThread(QThread):
                                 + ", ".join(import_summary.selected_headers)
                             )
                     else:
-                        self.progress_update.emit(0, "Importing source data from Outlook...")
+                        self._emit_progress_update(0, "Importing source data from Outlook...")
                         self.logger.log("Importing source data from Outlook email")
                         import_summary = import_conversion_email_to_workbook(
                             run_folder=self.run_folder,
@@ -1276,7 +1435,7 @@ class ExtractionThread(QThread):
                         )
                         self.outlook_import_summary = import_summary
                         self.excel_path = import_summary.workbook_path
-                        self.progress_update.emit(
+                        self._emit_progress_update(
                             0,
                             f"Imported {import_summary.imported_row_count} row(s) from Outlook email",
                         )
@@ -1291,7 +1450,7 @@ class ExtractionThread(QThread):
                         f"{traceback.format_exc()}"
                     )
                     self.logger.log(error_msg)
-                    self.finished.emit(
+                    self._emit_finished_state(
                         False,
                         f"Failed to import source data from {self.source_mode.title()}: {e}",
                         None,
@@ -1306,6 +1465,7 @@ class ExtractionThread(QThread):
                         if self.source_mode == "manual"
                         else "IRT workbook source"
                     )
+                    self._emit_precheck_progress(14, "Preparing conversion email context...")
                     self.logger.log(f"Resolving Outlook reply context for {source_label}")
                     self.outlook_import_summary = find_conversion_email_context(
                         logger=self.logger,
@@ -1318,6 +1478,68 @@ class ExtractionThread(QThread):
                     self.logger.log(
                         "Could not resolve Outlook reply context for the "
                         f"{source_label}: {e}"
+                    )
+
+            if self.source_mode == "irt" and self.audit_mode in {"both", "pre"}:
+                try:
+                    self._raise_if_stop_requested()
+                    self._emit_precheck_progress(17, "Sending pre-check email...")
+                    self.logger.log("Sending pre-check Outlook email for processed IRT rows")
+                    from utils.outlook_mailer import send_preaudit_email
+
+                    if self.outlook_import_summary is not None:
+                        preaudit_summary = send_preaudit_email(
+                            self.excel_path,
+                            self.logger,
+                            source_message_entry_id=self.outlook_import_summary.message_entry_id,
+                            source_message_store_id=self.outlook_import_summary.message_store_id,
+                            fallback_to=self.outlook_import_summary.to_recipients,
+                            fallback_cc=self.outlook_import_summary.cc_recipients,
+                            override_to=recipient_override_to or None,
+                            override_cc=recipient_override_cc or None,
+                        )
+                    else:
+                        preaudit_summary = send_preaudit_email(
+                            self.excel_path,
+                            self.logger,
+                            override_to=recipient_override_to or None,
+                            override_cc=recipient_override_cc or None,
+                        )
+
+                    self.logger.log(
+                        f"Pre-check email sent with {preaudit_summary.row_count} processed "
+                        f"{'row' if preaudit_summary.row_count == 1 else 'rows'}."
+                    )
+                    self._emit_precheck_progress(
+                        20,
+                        f"Pre-check email sent with {preaudit_summary.row_count} processed row(s)",
+                    )
+                    if self.audit_mode == "pre":
+                        self._emit_finished_state(
+                            True,
+                            (
+                                f"Pre-check email sent with {preaudit_summary.row_count} "
+                                f"processed {'row' if preaudit_summary.row_count == 1 else 'rows'}."
+                            ),
+                            self.excel_path,
+                        )
+                        return
+                except InterruptedError:
+                    raise
+                except Exception as e:
+                    self.logger.log(
+                        f"Error sending pre-check Outlook email: {e}\n{traceback.format_exc()}"
+                    )
+                    if self.audit_mode == "pre":
+                        self._emit_finished_state(
+                            False,
+                            f"Pre-check email could not be sent automatically: {e}",
+                            self.excel_path,
+                        )
+                        return
+                    self._emit_precheck_progress(
+                        20,
+                        "Pre-check email could not be sent automatically; continuing...",
                     )
 
             try:
@@ -1336,7 +1558,7 @@ class ExtractionThread(QThread):
             except Exception as e:
                 error_msg = f"Error initializing components: {e}\n{traceback.format_exc()}"
                 self.logger.log(error_msg)
-                self.finished.emit(False, f"Failed to initialize: {e}", None)
+                self._emit_finished_state(False, f"Failed to initialize: {e}", None)
                 return
 
             try:
@@ -1348,27 +1570,27 @@ class ExtractionThread(QThread):
             except Exception as e:
                 error_msg = f"Error reading LNI data: {e}\n{traceback.format_exc()}"
                 self.logger.log(error_msg)
-                self.finished.emit(False, f"Failed to read Excel file: {e}", None)
+                self._emit_finished_state(False, f"Failed to read Excel file: {e}", None)
                 return
 
             if total_lnis == 0:
                 self.logger.log("No LNI data found in Excel file")
-                self.finished.emit(False, "No LNI data found in Excel file", None)
+                self._emit_finished_state(False, "No LNI data found in Excel file", None)
                 return
 
-            self.progress_update.emit(0, f"Starting extraction of {total_lnis} LNIs...")
+            self._emit_extraction_progress(0, f"Starting extraction of {total_lnis} LNIs...")
             self.logger.log(f"Starting extraction of {total_lnis} LNIs")
 
             try:
                 self._raise_if_stop_requested()
                 if not scraper.launch_browser(headless_mode=self.headless_mode):
                     self.logger.log("Failed to launch browser")
-                    self.finished.emit(False, "Failed to launch browser", None)
+                    self._emit_finished_state(False, "Failed to launch browser", None)
                     return
 
                 if not scraper.navigate_to_lexis():
                     self.logger.log("Failed to navigate to Lexis website")
-                    self.finished.emit(False, "Failed to navigate to Lexis website", None)
+                    self._emit_finished_state(False, "Failed to navigate to Lexis website", None)
                     return
 
                 login_result = scraper.login(self.user_id, self.password)
@@ -1401,7 +1623,7 @@ class ExtractionThread(QThread):
                             "check the run log for details."
                         )
 
-                    self.finished.emit(False, user_message, None)
+                    self._emit_finished_state(False, user_message, None)
                     return
 
                 if self.remember_credentials:
@@ -1422,7 +1644,7 @@ class ExtractionThread(QThread):
             except Exception as e:
                 error_msg = f"Error during browser setup/login: {e}\n{traceback.format_exc()}"
                 self.logger.log(error_msg)
-                self.finished.emit(False, f"Browser/login error: {e}", None)
+                self._emit_finished_state(False, f"Browser/login error: {e}", None)
                 return
 
             processed = 0
@@ -1433,7 +1655,7 @@ class ExtractionThread(QThread):
                     self._raise_if_stop_requested()
                     processed += 1
                     progress = int((processed / total_lnis) * 100)
-                    self.progress_update.emit(
+                    self._emit_extraction_progress(
                         progress,
                         f"Processing LNI {processed}/{total_lnis}: {lni}",
                     )
@@ -1449,14 +1671,15 @@ class ExtractionThread(QThread):
                     excel_handler.write_lexis_cite(row, lexis_cite)
 
                     if lexis_cite == "Not Available":
-                        self.progress_update.emit(
+                        self._emit_extraction_progress(
                             progress,
                             f"No results found for LNI {processed}/{total_lnis}",
                         )
                     else:
-                        self.progress_update.emit(
+                        lni_label = "LNI" if total_lnis == 1 else "LNIs"
+                        self._emit_extraction_progress(
                             progress,
-                            f"Successfully extracted LNI {processed}/{total_lnis}",
+                            f"Successfully extracted {processed}/{total_lnis} {lni_label}",
                         )
 
                 except InterruptedError:
@@ -1486,8 +1709,7 @@ class ExtractionThread(QThread):
             except Exception as e:
                 error_msg = f"Error saving output file: {e}\n{traceback.format_exc()}"
                 self.logger.log(error_msg)
-                self.logger.save_log()
-                self.finished.emit(False, f"Failed to save output file: {e}", None)
+                self._emit_finished_state(False, f"Failed to save output file: {e}", None)
                 return
 
             completion_message = "Workbook saved."
@@ -1535,13 +1757,7 @@ class ExtractionThread(QThread):
                     f"{e}"
                 )
 
-            try:
-                self.logger.log("Saving log file")
-                self.logger.save_log()
-            except Exception as e:
-                self.logger.log(f"Error saving log file: {e}\n{traceback.format_exc()}")
-
-            self.finished.emit(
+            self._emit_finished_state(
                 True,
                 completion_message,
                 output_path,
@@ -1554,11 +1770,7 @@ class ExtractionThread(QThread):
             error_msg = f"Critical error in extraction process: {e}\n{traceback.format_exc()}"
             if self.logger:
                 self.logger.log(error_msg)
-                try:
-                    self.logger.save_log()
-                except Exception:
-                    pass
-            self.finished.emit(False, f"Extraction failed: {e}", None)
+            self._emit_finished_state(False, f"Extraction failed: {e}", None)
 
         finally:
             if scraper is not None:
@@ -2159,6 +2371,43 @@ class ThemedCalendarPopup(QFrame):
         self.closed.emit()
 
 
+class DateCalendarButton(QToolButton):
+    """A crisp, anti-aliased trailing calendar segment for themed date fields."""
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+        radius = min(12.0, height / 2.0)
+        path = QPainterPath()
+        path.moveTo(0, 0)
+        path.lineTo(width - radius, 0)
+        path.quadTo(width, 0, width, radius)
+        path.lineTo(width, height - radius)
+        path.quadTo(width, height, width - radius, height)
+        path.lineTo(0, height)
+        path.closeSubpath()
+
+        painter.fillPath(
+            path,
+            QColor("#132238") if self.underMouse() else QColor("#0f1827"),
+        )
+        painter.setPen(QPen(QColor("#22304a"), 1))
+        painter.drawPath(path)
+        painter.drawLine(0, 1, 0, max(1, height - 2))
+
+        icon_size = 19
+        icon_rect = QRect(
+            (width - icon_size) // 2,
+            (height - icon_size) // 2,
+            icon_size,
+            icon_size,
+        )
+        self.icon().paint(painter, icon_rect)
+
+
 class ThemedDateEdit(QDateEdit):
     """Read-only themed date field backed by a custom popup calendar."""
 
@@ -2170,6 +2419,16 @@ class ThemedDateEdit(QDateEdit):
 
         self.calendar_popup_widget = ThemedCalendarPopup(self)
         self.calendar_popup_widget.date_selected.connect(self._apply_selected_date)
+
+        self.calendar_button = DateCalendarButton(self)
+        self.calendar_button.setObjectName("DateCalendarButton")
+        calendar_icon = Path(__file__).resolve().parent.parent / "assets" / "calendar_cyan.svg"
+        self.calendar_button.setIcon(QIcon(str(calendar_icon)))
+        self.calendar_button.setIconSize(QSize(19, 19))
+        self.calendar_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.calendar_button.setToolTip("Choose date")
+        self.calendar_button.setStyleSheet("background: transparent; border: none;")
+        self.calendar_button.clicked.connect(self.toggle_calendar_popup)
 
         line_edit = self.lineEdit()
         if line_edit is not None:
@@ -2207,6 +2466,27 @@ class ThemedDateEdit(QDateEdit):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        """Keep the custom calendar button aligned as the field resizes."""
+        super().resizeEvent(event)
+        self._position_calendar_button()
+
+    def showEvent(self, event) -> None:
+        """Position the embedded button after Qt assigns the final layout geometry."""
+        super().showEvent(event)
+        self._position_calendar_button()
+
+    def _position_calendar_button(self) -> None:
+        """Place the calendar button inside the trailing segmented control area."""
+        button_width = 38
+        self.calendar_button.setGeometry(
+            self.width() - button_width,
+            0,
+            button_width,
+            self.height(),
+        )
+
 
     def keyPressEvent(self, event) -> None:
         """Open or close the themed calendar for common picker keys."""
@@ -2340,6 +2620,60 @@ class HeaderColorComboBox(FloatingPopupComboBox):
     def hidePopup(self):
         """Hide the dedicated popup when Qt requests the combo to close."""
         self.color_popup.hide()
+
+
+class SourceModePopup(HeaderColorPopup):
+    """Dedicated single-click popup for the source selector."""
+
+    source_index_selected = pyqtSignal(int)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.color_index_selected.connect(self.source_index_selected)
+
+    def _visible_row_count(self) -> int:
+        """Keep the compact Source popup sized to its available choices."""
+        return max(1, min(5, self.list_widget.count()))
+
+    def refresh_from_combo(self, combo: QComboBox) -> None:
+        """List selectable source modes while leaving the display placeholder out."""
+        self.list_widget.clear()
+        current_row = 0
+        for index in range(combo.count()):
+            source_mode = combo.itemData(index, Qt.ItemDataRole.UserRole)
+            if source_mode is None:
+                continue
+
+            item = QListWidgetItem(combo.itemIcon(index), combo.itemText(index))
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            self.list_widget.addItem(item)
+            if index == combo.currentIndex():
+                current_row = self.list_widget.count() - 1
+
+        self.list_widget.setCurrentRow(current_row)
+
+
+class SourceModeComboBox(FloatingPopupComboBox):
+    """Source selector backed by a deliberate one-click popup list."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.source_popup = SourceModePopup(self)
+        self.source_popup.source_index_selected.connect(self._apply_popup_selection)
+
+    def _apply_popup_selection(self, index: int) -> None:
+        """Commit a chosen Source option from the dedicated popup."""
+        self.setCurrentIndex(index)
+
+    def showPopup(self):
+        """Open the explicit single-click source popup."""
+        if not self.isEnabled():
+            return
+        self.source_popup.show_for_combo(self)
+
+    def hidePopup(self):
+        """Close the dedicated Source popup when toggled or dismissed."""
+        self.source_popup.hide()
 
 
 class FolderTabButton(QPushButton):
@@ -3245,6 +3579,11 @@ class MainWindow(QMainWindow):
             ("IRT Results", "irt"),
             ("Template", "manual"),
         )
+        self.audit_mode_options = (
+            ("Both Checks", "both"),
+            ("Pre-Check Only", "pre"),
+            ("Post-Check Only", "post"),
+        )
         self.developer_mode_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
         self.developer_mode_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.developer_mode_shortcut.setAutoRepeat(False)
@@ -3267,6 +3606,7 @@ class MainWindow(QMainWindow):
         """Apply the application stylesheet."""
         assets_dir = Path(__file__).resolve().parent.parent / "assets"
         chevron_icon_url = str((assets_dir / "chevron_down.png").resolve()).replace("\\", "/")
+        calendar_icon_url = str((assets_dir / "calendar_cyan.svg").resolve()).replace("\\", "/")
         checkmark_icon_url = str((assets_dir / "checkmark.png").resolve()).replace("\\", "/")
         stylesheet = """
             QMainWindow {
@@ -3282,8 +3622,8 @@ class MainWindow(QMainWindow):
             QFrame#HeaderCard {
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 1, y2: 1,
-                    stop: 0 #101826,
-                    stop: 1 #172033
+                    stop: 0 rgba(16, 24, 38, 228),
+                    stop: 1 rgba(23, 32, 51, 216)
                 );
                 border: 1px solid #22304a;
                 border-radius: 18px;
@@ -3291,7 +3631,7 @@ class MainWindow(QMainWindow):
 
             QFrame#MainAuthCard,
             QFrame#SectionCard {
-                background-color: #101722;
+                background-color: rgba(16, 23, 34, 214);
                 border: 1px solid #1d293d;
                 border-radius: 16px;
             }
@@ -3366,8 +3706,17 @@ class MainWindow(QMainWindow):
                 min-height: 20px;
             }
 
+            QDateEdit {
+                padding: 8px 11px;
+            }
+
             QComboBox {
                 combobox-popup: 0;
+            }
+
+            QComboBox#SourceModeCombo {
+                font-size: 10px;
+                padding-left: 8px;
             }
 
             QComboBox:hover,
@@ -3396,11 +3745,41 @@ class MainWindow(QMainWindow):
                 background-color: #0f1827;
             }
 
-            QComboBox::down-arrow,
+            QDateEdit::drop-down {
+                width: 0px;
+                border: none;
+                background: transparent;
+            }
+
             QDateEdit::down-arrow {
+                width: 0px;
+                height: 0px;
+            }
+
+            QToolButton#DateCalendarButton {
+                background-color: #0f1827;
+                border: 1px solid #22304a;
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                border-top-right-radius: 12px;
+                border-bottom-right-radius: 12px;
+                padding: 0;
+            }
+
+            QToolButton#DateCalendarButton:hover {
+                background-color: #132238;
+            }
+
+            QComboBox::down-arrow {
                 image: url("__CHEVRON_ICON_URL__");
                 width: 13px;
                 height: 9px;
+            }
+
+            QDateEdit::down-arrow {
+                image: url("__CALENDAR_ICON_URL__");
+                width: 19px;
+                height: 19px;
             }
 
             QComboBox QAbstractItemView {
@@ -3992,16 +4371,23 @@ class MainWindow(QMainWindow):
             }
 
             QFrame#DeveloperPanel {
-                background-color: #0b1220;
+                background-color: rgba(11, 18, 32, 228);
                 border: 1px solid #22304a;
                 border-radius: 12px;
             }
 
             QFrame#InlineOptionsCard,
-            QFrame#InlineFiltersCard {
-                background-color: #0c1422;
+            QFrame#InlineFiltersCard,
+            QFrame#InlineWorkflowCard {
+                background-color: rgba(12, 20, 34, 224);
                 border: 1px solid #22304a;
                 border-radius: 16px;
+            }
+
+            QFrame#DateRangeTray {
+                background-color: rgba(7, 15, 27, 164);
+                border: 1px solid #1b2d45;
+                border-radius: 13px;
             }
 
             QFrame#HeaderInnerDivider {
@@ -4016,6 +4402,15 @@ class MainWindow(QMainWindow):
 
             QFrame#WorkflowDivider {
                 background-color: #22304a;
+                border: none;
+            }
+
+            QLabel#DateRangeArrow {
+                min-width: 30px;
+                max-width: 30px;
+                min-height: 38px;
+                max-height: 38px;
+                background: transparent;
                 border: none;
             }
 
@@ -4084,8 +4479,8 @@ class MainWindow(QMainWindow):
             QFrame#RecipientTabPanel {
                 background-color: #0a1220;
                 border: 1px solid #22304a;
-                border-top-left-radius: 0px;
-                border-top-right-radius: 0px;
+                border-top-left-radius: 14px;
+                border-top-right-radius: 14px;
                 border-bottom-left-radius: 14px;
                 border-bottom-right-radius: 14px;
             }
@@ -4129,6 +4524,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             stylesheet
             .replace("__CHEVRON_ICON_URL__", chevron_icon_url)
+            .replace("__CALENDAR_ICON_URL__", calendar_icon_url)
             .replace("__CHECKMARK_ICON_URL__", checkmark_icon_url)
         )
 
@@ -4187,9 +4583,15 @@ class MainWindow(QMainWindow):
 
     def _load_saved_source_mode(self) -> str:
         """Return the persisted source mode when it is still supported."""
-        default_mode = self.source_mode_options[0][1] if self.source_mode_options else "irt"
-        saved_mode = str(load_setting(SOURCE_MODE_KEY, default_mode) or default_mode).strip().lower()
+        saved_mode = str(load_setting(SOURCE_MODE_KEY, "") or "").strip().lower()
         supported_modes = {mode for _label, mode in self.source_mode_options}
+        return saved_mode if saved_mode in supported_modes else ""
+
+    def _load_saved_audit_mode(self) -> str:
+        """Return the persisted audit mode when it is still supported."""
+        default_mode = self.audit_mode_options[0][1] if self.audit_mode_options else "both"
+        saved_mode = str(load_setting(AUDIT_MODE_KEY, default_mode) or default_mode).strip().lower()
+        supported_modes = {mode for _label, mode in self.audit_mode_options}
         return saved_mode if saved_mode in supported_modes else default_mode
 
     def _restore_saved_recipient_overrides(self) -> None:
@@ -4328,14 +4730,16 @@ class MainWindow(QMainWindow):
         return divider
 
     def _decorate_date_edit(self, date_edit: QDateEdit) -> None:
-        """Add the leading calendar affordance while keeping popup logic custom."""
+        """Keep date text uncluttered; the calendar affordance lives on its popup button."""
         line_edit = date_edit.lineEdit()
         if line_edit is None:
             return
 
-        icon_action = QAction(date_edit)
-        icon_action.setIcon(self._load_colored_icon("calendar", "#38bdf8", 20, vertical_offset=1))
-        line_edit.addAction(icon_action, QLineEdit.ActionPosition.LeadingPosition)
+        line_edit.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        )
+        # Reserve the calendar segment so the date centers in the readable text area.
+        line_edit.setTextMargins(0, 0, 38, 0)
 
     def _configure_dropdown_combo(
         self,
@@ -4384,9 +4788,26 @@ class MainWindow(QMainWindow):
             }
             """
         )
+        # Commit standard combo popup choices on the first click.  Qt's generic
+        # QListView popup can otherwise leave an item merely highlighted until
+        # a second activation click in a frameless/translucent window.
+        popup_view.clicked.connect(
+            lambda index, target_combo=combo: self._commit_dropdown_popup_selection(
+                target_combo,
+                index.row(),
+            )
+        )
         combo.setView(popup_view)
         combo.setMaxVisibleItems(max(1, max_visible_items))
         combo.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    @staticmethod
+    def _commit_dropdown_popup_selection(combo: QComboBox, row: int) -> None:
+        """Apply a popup row immediately, then close the popup."""
+        if row < 0 or row >= combo.count():
+            return
+        combo.setCurrentIndex(row)
+        combo.hidePopup()
 
     def _populate_header_color_combo(self):
         """Fill the dropdown with preset Excel header colors."""
@@ -4442,7 +4863,18 @@ class MainWindow(QMainWindow):
         saved_source_mode = self._load_saved_source_mode()
         selected_index = 0
 
-        for index, (label, source_mode) in enumerate(self.source_mode_options):
+        # The neutral display state avoids implying a source before the user chooses one.
+        self.source_mode_combo.addItem(
+            self._load_colored_icon("source_irt", "#38bdf8", 24, vertical_offset=1),
+            "Source",
+        )
+        self.source_mode_combo.setItemData(
+            0,
+            None,
+            Qt.ItemDataRole.UserRole,
+        )
+
+        for index, (label, source_mode) in enumerate(self.source_mode_options, start=1):
             icon_name = "source_irt" if source_mode == "irt" else "template_file"
             self.source_mode_combo.addItem(
                 self._load_colored_icon(icon_name, "#38bdf8", 24, vertical_offset=1),
@@ -4460,12 +4892,35 @@ class MainWindow(QMainWindow):
         self.source_mode_combo.blockSignals(False)
         self._update_source_mode_tooltip()
 
+    def _populate_audit_mode_combo(self):
+        """Fill the audit-mode selector with supported run behaviors."""
+        self.audit_mode_combo.blockSignals(True)
+        self.audit_mode_combo.clear()
+        saved_audit_mode = self._load_saved_audit_mode()
+        selected_index = 0
+
+        for index, (label, audit_mode) in enumerate(self.audit_mode_options):
+            self.audit_mode_combo.addItem(label)
+            self.audit_mode_combo.setItemData(
+                index,
+                audit_mode,
+                Qt.ItemDataRole.UserRole,
+            )
+            if audit_mode == saved_audit_mode:
+                selected_index = index
+
+        self.audit_mode_combo.setCurrentIndex(selected_index)
+        self.audit_mode_combo.blockSignals(False)
+        self._update_audit_mode_tooltip()
+
     def _sync_source_mode_layout(self) -> None:
         """Refresh source-specific controls without reshuffling the whole form."""
         is_manual = self._current_source_mode() == "manual"
         if hasattr(self, "source_template_btn"):
             self.source_template_btn.setVisible(is_manual)
             self.source_template_btn.setEnabled(self.extraction_thread is None and is_manual)
+        if hasattr(self, "audit_mode_combo"):
+            self._update_audit_mode_tooltip()
 
     def _current_source_mode(self) -> str:
         """Return the currently selected extraction source mode."""
@@ -4474,8 +4929,22 @@ class MainWindow(QMainWindow):
         selected_mode = self.source_mode_combo.currentData(Qt.ItemDataRole.UserRole)
         return str(selected_mode or (self.source_mode_options[0][1] if self.source_mode_options else "irt"))
 
+    def _current_audit_mode(self) -> str:
+        """Return the currently selected audit mode."""
+        if not hasattr(self, "audit_mode_combo"):
+            return self.audit_mode_options[0][1] if self.audit_mode_options else "both"
+        selected_mode = self.audit_mode_combo.currentData(Qt.ItemDataRole.UserRole)
+        return str(selected_mode or (self.audit_mode_options[0][1] if self.audit_mode_options else "both"))
+
     def _update_source_mode_tooltip(self):
         """Describe the behavior of the currently selected source mode."""
+        selected_mode = self.source_mode_combo.currentData(Qt.ItemDataRole.UserRole)
+        if selected_mode is None:
+            self.source_mode_combo.setToolTip(
+                "Choose IRT Results or Template. IRT Results is used until a source is selected."
+            )
+            return
+
         source_mode = self._current_source_mode()
         if source_mode == "manual":
             self.source_mode_combo.setToolTip(
@@ -4485,6 +4954,31 @@ class MainWindow(QMainWindow):
         self.source_mode_combo.setToolTip(
             "Run Extraction will import rows from IRT Search Inventory using the selected date range across both courts."
         )
+
+    def _update_audit_mode_tooltip(self):
+        """Describe the behavior of the current audit mode."""
+        audit_mode = self._current_audit_mode()
+        source_mode = self._current_source_mode()
+
+        if audit_mode == "pre":
+            message = (
+                "Send the processed pre-check email and stop before Lexis scraping. "
+                "Requires IRT Results source."
+            )
+        elif audit_mode == "post":
+            message = (
+                "Skip the processed pre-check email and only run the Lexis post-check."
+            )
+        else:
+            message = (
+                "On IRT runs, send the processed pre-check email first, then continue "
+                "into the Lexis post-check."
+            )
+
+        if source_mode == "manual" and audit_mode != "post":
+            message += " Switch Source to IRT Results to use this mode."
+
+        self.audit_mode_combo.setToolTip(message)
 
     def _idle_ready_detail(self) -> str:
         """Return source-aware helper copy for the idle state."""
@@ -4502,6 +4996,13 @@ class MainWindow(QMainWindow):
         self._update_source_mode_tooltip()
         self._sync_source_mode_layout()
         self._update_window_size()
+        if self.extraction_thread is None and not self.developer_mode_enabled:
+            self._set_status_state("Ready", self._idle_ready_detail(), "ready")
+
+    def _on_audit_mode_changed(self, *_args):
+        """Persist the audit mode and refresh helper copy."""
+        save_setting(AUDIT_MODE_KEY, self._current_audit_mode())
+        self._update_audit_mode_tooltip()
         if self.extraction_thread is None and not self.developer_mode_enabled:
             self._set_status_state("Ready", self._idle_ready_detail(), "ready")
 
@@ -4886,6 +5387,15 @@ class MainWindow(QMainWindow):
             if popup is not None and popup.isVisible():
                 return True
 
+        for combo_name, popup_name in (
+            ("source_mode_combo", "source_popup"),
+            ("header_color_combo", "color_popup"),
+        ):
+            combo = getattr(self, combo_name, None)
+            popup = getattr(combo, popup_name, None) if combo is not None else None
+            if popup is not None and popup.isVisible():
+                return True
+
         for date_edit_name in ("irt_start_date_edit", "irt_end_date_edit"):
             date_edit = getattr(self, date_edit_name, None)
             if date_edit is None:
@@ -5133,8 +5643,8 @@ class MainWindow(QMainWindow):
 
     def init_ui(self):
         """Initialize the UI."""
-        self.base_window_size = (536, 548)
-        self.dev_mode_window_size = (536, 548)
+        self.base_window_size = (488, 520)
+        self.dev_mode_window_size = (488, 520)
         self.setWindowTitle("PLR000-CCA001 Extractor")
         self._update_window_size()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
@@ -5253,15 +5763,15 @@ class MainWindow(QMainWindow):
         self.idle_bubble_overlay.hide()
         auth_layout = QVBoxLayout(auth_card)
         auth_layout.setSpacing(0)
-        auth_layout.setContentsMargins(14, 10, 14, 12)
+        auth_layout.setContentsMargins(12, 9, 12, 10)
         auth_layout.addWidget(title_bar)
         auth_layout.addWidget(header_separator)
 
         auth_body = QWidget()
         self.auth_body = auth_body
         auth_body_layout = QVBoxLayout(auth_body)
-        auth_body_layout.setSpacing(4)
-        auth_body_layout.setContentsMargins(0, 2, 0, 0)
+        auth_body_layout.setSpacing(5)
+        auth_body_layout.setContentsMargins(0, 1, 0, 0)
 
         credentials_section = QWidget()
         credentials_section.setSizePolicy(
@@ -5320,16 +5830,31 @@ class MainWindow(QMainWindow):
 
         auth_body_layout.addWidget(credentials_section)
 
-        self.source_mode_combo = FloatingPopupComboBox()
+        self.source_mode_combo = SourceModeComboBox()
+        self.source_mode_combo.setObjectName("SourceModeCombo")
         self.source_mode_combo.setMinimumHeight(38)
         self.source_mode_combo.setIconSize(QSize(24, 24))
+        source_combo_font = self.source_mode_combo.font()
+        source_combo_font.setPointSize(10)
+        self.source_mode_combo.setFont(source_combo_font)
         self.source_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.source_mode_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
         )
-        self._configure_dropdown_combo(self.source_mode_combo, max_visible_items=5)
         self._populate_source_mode_combo()
         self.source_mode_combo.currentIndexChanged.connect(self._on_source_mode_changed)
+
+        self.audit_mode_combo = FloatingPopupComboBox()
+        self.audit_mode_combo.setMinimumHeight(38)
+        self.audit_mode_combo.setMinimumWidth(184)
+        self.audit_mode_combo.setMaximumWidth(208)
+        self.audit_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.audit_mode_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self._configure_dropdown_combo(self.audit_mode_combo, max_visible_items=3)
+        self._populate_audit_mode_combo()
+        self.audit_mode_combo.currentIndexChanged.connect(self._on_audit_mode_changed)
 
         self.save_credentials_checkbox = QCheckBox("Remember ID")
         self.headless_checkbox = QCheckBox("Headless Mode")
@@ -5368,31 +5893,32 @@ class MainWindow(QMainWindow):
         settings_header_color_layout.addWidget(settings_header_color_label)
         settings_header_color_layout.addWidget(self.header_color_combo)
         self.settings_popup.add_widget(settings_header_color_group)
+
+        settings_audit_mode_group = QWidget()
+        settings_audit_mode_layout = QVBoxLayout(settings_audit_mode_group)
+        settings_audit_mode_layout.setContentsMargins(0, 0, 0, 0)
+        settings_audit_mode_layout.setSpacing(6)
+        settings_audit_mode_label = QLabel("Check Mode")
+        settings_audit_mode_label.setObjectName("FieldLabel")
+        settings_audit_mode_layout.addWidget(settings_audit_mode_label)
+        settings_audit_mode_layout.addWidget(self.audit_mode_combo)
+        self.settings_popup.add_widget(settings_audit_mode_group)
+
         self.settings_popup.add_widget(self.compact_preview_checkbox)
 
         controls_frame = QFrame()
-        controls_frame.setObjectName("InlineOptionsCard")
+        controls_frame.setObjectName("InlineWorkflowCard")
         controls_frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        controls_outer_layout = QHBoxLayout(controls_frame)
-        controls_outer_layout.setContentsMargins(10, 7, 10, 7)
-        controls_outer_layout.setSpacing(0)
+        controls_outer_layout = QVBoxLayout(controls_frame)
+        controls_outer_layout.setContentsMargins(8, 6, 8, 7)
+        controls_outer_layout.setSpacing(6)
 
         controls_inner = QWidget()
-        controls_inner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        controls_inner.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         controls_layout = QGridLayout(controls_inner)
         controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setHorizontalSpacing(8)
-        controls_layout.setVerticalSpacing(4)
-
-        source_label = QLabel("Source")
-        source_label.setObjectName("FieldLabel")
-        source_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-        controls_layout.addWidget(source_label, 0, 0)
-
-        recipients_label = QLabel("Recipients")
-        recipients_label.setObjectName("FieldLabel")
-        recipients_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-        controls_layout.addWidget(recipients_label, 0, 1)
+        controls_layout.setHorizontalSpacing(7)
+        controls_layout.setVerticalSpacing(3)
 
         source_selector_row = QWidget()
         source_selector_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -5400,8 +5926,8 @@ class MainWindow(QMainWindow):
         source_selector_layout.setContentsMargins(0, 0, 0, 0)
         source_selector_layout.setSpacing(5)
         source_selector_layout.addWidget(self.source_mode_combo, 1)
-        self.source_mode_combo.setMinimumWidth(146)
-        self.source_mode_combo.setMaximumWidth(186)
+        self.source_mode_combo.setMinimumWidth(190)
+        self.source_mode_combo.setMaximumWidth(194)
 
         self.source_template_btn = QPushButton("+")
         self.source_template_btn.setObjectName("SquareAccentButton")
@@ -5410,14 +5936,14 @@ class MainWindow(QMainWindow):
         self.source_template_btn.clicked.connect(self.generate_template)
         self.source_template_btn.hide()
         source_selector_layout.addWidget(self.source_template_btn, 0)
-        controls_layout.addWidget(source_selector_row, 1, 0)
+        controls_layout.addWidget(source_selector_row, 0, 0)
 
         self.recipients_toggle_btn = QPushButton("Recipients")
         self.recipients_toggle_btn.setObjectName("InlineToggleButton")
         self.recipients_toggle_btn.setCheckable(True)
         self.recipients_toggle_btn.setMinimumHeight(38)
-        self.recipients_toggle_btn.setMinimumWidth(130)
-        self.recipients_toggle_btn.setMaximumWidth(146)
+        self.recipients_toggle_btn.setMinimumWidth(126)
+        self.recipients_toggle_btn.setMaximumWidth(134)
         self.recipients_toggle_btn.setIcon(
             self._load_colored_icon("recipients", "#cbd5e1", 24, vertical_offset=1)
         )
@@ -5426,86 +5952,91 @@ class MainWindow(QMainWindow):
             "Manually override the outgoing To and CC recipients for this run."
         )
         self.recipients_toggle_btn.clicked.connect(self._toggle_recipient_panel)
-        controls_layout.addWidget(self.recipients_toggle_btn, 1, 1)
+        controls_layout.addWidget(self.recipients_toggle_btn, 0, 1)
 
-        self.settings_toggle_btn = QPushButton("Settings")
+        self.settings_toggle_btn = QPushButton()
         self.settings_toggle_btn.setObjectName("InlineToggleButton")
         self.settings_toggle_btn.setCheckable(True)
-        self.settings_toggle_btn.setMinimumHeight(50)
-        self.settings_toggle_btn.setMinimumWidth(94)
-        self.settings_toggle_btn.setMaximumWidth(100)
+        self.settings_toggle_btn.setMinimumHeight(38)
+        self.settings_toggle_btn.setMinimumWidth(42)
+        self.settings_toggle_btn.setMaximumWidth(42)
         self.settings_toggle_btn.setIcon(
-            self._load_colored_icon("settings", "#67e8f9", 24, vertical_offset=1)
+            self._load_colored_icon("settings_cog", "#67e8f9", 24, vertical_offset=1)
         )
         self.settings_toggle_btn.setIconSize(QSize(20, 20))
         self.settings_toggle_btn.setToolTip(
-            "Show Remember ID, Headless Mode, and Header Color settings."
+            "Show Remember ID, Headless Mode, Header Color, and Check Mode settings."
         )
         self.settings_toggle_btn.clicked.connect(self._toggle_settings_panel)
         controls_layout.addWidget(
             self.settings_toggle_btn,
             0,
             2,
-            2,
             1,
-            Qt.AlignmentFlag.AlignBottom,
+            Qt.AlignmentFlag.AlignVCenter,
         )
-        controls_outer_layout.addStretch(1)
-        controls_outer_layout.addWidget(controls_inner, 0, Qt.AlignmentFlag.AlignHCenter)
-        controls_outer_layout.addStretch(1)
-        auth_body_layout.addWidget(controls_frame)
+        controls_outer_layout.addWidget(
+            controls_inner,
+            0,
+            Qt.AlignmentFlag.AlignHCenter,
+        )
 
         self.irt_filters_frame = QFrame()
-        self.irt_filters_frame.setObjectName("InlineFiltersCard")
+        self.irt_filters_frame.setObjectName("DateRangeTray")
         self.irt_filters_frame.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
             QSizePolicy.Policy.Fixed,
         )
         irt_filters_outer_layout = QHBoxLayout(self.irt_filters_frame)
         irt_filters_outer_layout.setSpacing(0)
-        irt_filters_outer_layout.setContentsMargins(10, 5, 10, 5)
+        irt_filters_outer_layout.setContentsMargins(9, 5, 9, 5)
 
         irt_filters_inner = QWidget()
         irt_filters_inner.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         irt_filters_layout = QHBoxLayout(irt_filters_inner)
-        irt_filters_layout.setSpacing(8)
+        irt_filters_layout.setSpacing(12)
         irt_filters_layout.setContentsMargins(0, 0, 0, 0)
 
         self.irt_start_date_edit = ThemedDateEdit()
         self.irt_start_date_edit.setDisplayFormat("M/d/yyyy")
         self.irt_start_date_edit.setMinimumHeight(38)
         self._decorate_date_edit(self.irt_start_date_edit)
-        self.irt_start_field = self._create_workflow_field(
-            "From",
-            self.irt_start_date_edit,
-            176,
-            194,
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-        )
-        irt_filters_layout.addWidget(self.irt_start_field, 1)
+        self.irt_start_date_edit.setMinimumWidth(178)
+        self.irt_start_date_edit.setMaximumWidth(188)
+        self.irt_start_date_edit.setToolTip("Start date")
+        irt_filters_layout.addWidget(self.irt_start_date_edit)
 
-        self.workflow_divider_dates = self._create_workflow_divider()
-        irt_filters_layout.addWidget(self.workflow_divider_dates)
+        self.date_range_arrow = QLabel()
+        self.date_range_arrow.setObjectName("DateRangeArrow")
+        self.date_range_arrow.setAlignment(
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.date_range_arrow.setToolTip("Date range: start to end")
+        self.date_range_arrow.setPixmap(
+            self._load_colored_icon("range_arrow", "#67e8f9", 22).pixmap(22, 22)
+        )
+        irt_filters_layout.addWidget(self.date_range_arrow)
 
         self.irt_end_date_edit = ThemedDateEdit()
         self.irt_end_date_edit.setDisplayFormat("M/d/yyyy")
         self.irt_end_date_edit.setMinimumHeight(38)
         self._decorate_date_edit(self.irt_end_date_edit)
-        self.irt_end_field = self._create_workflow_field(
-            "To",
-            self.irt_end_date_edit,
-            176,
-            194,
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-        )
-        irt_filters_layout.addWidget(self.irt_end_field, 1)
+        self.irt_end_date_edit.setMinimumWidth(178)
+        self.irt_end_date_edit.setMaximumWidth(188)
+        self.irt_end_date_edit.setToolTip("End date")
+        irt_filters_layout.addWidget(self.irt_end_date_edit)
 
         self._apply_default_irt_filters()
         self._sync_source_mode_layout()
         irt_filters_outer_layout.addStretch(1)
         irt_filters_outer_layout.addWidget(irt_filters_inner, 0, Qt.AlignmentFlag.AlignHCenter)
         irt_filters_outer_layout.addStretch(1)
-        auth_body_layout.addWidget(self.irt_filters_frame)
+        controls_outer_layout.addWidget(
+            self.irt_filters_frame,
+            0,
+            Qt.AlignmentFlag.AlignHCenter,
+        )
+        auth_body_layout.addWidget(controls_frame)
 
         self.recipient_popup = RecipientOverridePopup(self)
         self.recipient_popup.closed.connect(self._on_recipient_popup_closed)
@@ -5523,13 +6054,13 @@ class MainWindow(QMainWindow):
 
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(8)
-        buttons_layout.setContentsMargins(4, 0, 4, 0)
+        buttons_layout.setContentsMargins(2, 0, 2, 0)
 
         self.view_folder_btn = QPushButton("View Folder")
         self.view_folder_btn.setObjectName("GhostButton")
         self.view_folder_btn.setMinimumHeight(42)
-        self.view_folder_btn.setMinimumWidth(142)
-        self.view_folder_btn.setMaximumWidth(152)
+        self.view_folder_btn.setMinimumWidth(132)
+        self.view_folder_btn.setMaximumWidth(140)
         self.view_folder_btn.setIcon(
             self._load_colored_icon("results_folder", "#9fb2ca", 22, vertical_offset=1)
         )
@@ -5542,8 +6073,8 @@ class MainWindow(QMainWindow):
         self.extract_btn = QPushButton("Run Extraction")
         self.extract_btn.setObjectName("PrimaryButton")
         self.extract_btn.setMinimumHeight(44)
-        self.extract_btn.setMinimumWidth(180)
-        self.extract_btn.setMaximumWidth(190)
+        self.extract_btn.setMinimumWidth(268)
+        self.extract_btn.setMaximumWidth(278)
         self.extract_btn.setIcon(self._load_colored_icon("play", "#ffffff", 28, vertical_offset=1))
         self.extract_btn.setIconSize(QSize(28, 28))
         self.extract_btn.setEnabled(False)
@@ -5930,10 +6461,19 @@ class MainWindow(QMainWindow):
 
         file_manager = FileManager()
         source_mode = self._current_source_mode()
+        audit_mode = self._current_audit_mode()
         excel_path = None
         irt_court_scope = "both"
         irt_start_date = None
         irt_end_date = None
+
+        if source_mode == "manual" and audit_mode != "post":
+            self._show_warning_dialog(
+                "Use IRT Results for pre-check",
+                "Pre-check email modes require Source to be set to IRT Results. "
+                "Switch Source to IRT Results, or change Check Mode to Post-Check Only.",
+            )
+            return
 
         if source_mode == "irt":
             irt_start_date = self.irt_start_date_edit.date().toPyDate()
@@ -5984,6 +6524,7 @@ class MainWindow(QMainWindow):
             )
         else:
             logger.log("Source data will be imported from IRT Search Inventory")
+        logger.log(f"Check mode selected: {audit_mode}")
         logger.log(f"Workbook header color selected: #{self.header_fill_color}")
         if recipient_to:
             logger.log(
@@ -6007,6 +6548,7 @@ class MainWindow(QMainWindow):
         self.save_credentials_checkbox.setEnabled(False)
         self.headless_checkbox.setEnabled(False)
         self.header_color_combo.setEnabled(False)
+        self.audit_mode_combo.setEnabled(False)
         self.source_mode_combo.setEnabled(False)
         self.irt_filters_frame.setEnabled(False)
         self.recipients_toggle_btn.setEnabled(False)
@@ -6026,7 +6568,15 @@ class MainWindow(QMainWindow):
                 "Opening manual workbook and starting extraction..."
                 if source_mode == "manual"
                 else (
-                    "Importing IRT results and starting extraction..."
+                    (
+                        "Importing IRT results and sending pre-check email..."
+                        if audit_mode == "pre"
+                        else (
+                            "Importing IRT results, sending pre-check email, and starting extraction..."
+                            if audit_mode == "both"
+                            else "Importing IRT results and starting extraction..."
+                        )
+                    )
                     if source_mode == "irt"
                     else "Importing Outlook data and starting extraction..."
                 )
@@ -6051,6 +6601,7 @@ class MainWindow(QMainWindow):
             manual_override_cc=recipient_cc,
             header_fill_color=self.header_fill_color,
             source_mode=source_mode,
+            audit_mode=audit_mode,
             irt_court_scope=irt_court_scope,
             irt_start_date=irt_start_date,
             irt_end_date=irt_end_date,
@@ -6062,18 +6613,28 @@ class MainWindow(QMainWindow):
 
     def update_progress(self, percentage: int, status: str):
         """Update progress bar and status."""
-        self.progress_bar.setValue(percentage)
+        if percentage < 0:
+            self.progress_bar.set_indeterminate(True)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("")
+        else:
+            self.progress_bar.set_indeterminate(False)
+            self.progress_bar.setValue(max(0, min(100, percentage)))
+            self.progress_bar.setFormat("%p%")
         self._set_status_state("Running", status, "working")
 
     def reset_ui(self):
         """Reset UI to initial state for next run."""
+        self.progress_bar.set_indeterminate(False)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
 
         self.id_input.setEnabled(True)
         self.password_input.setEnabled(True)
         self.save_credentials_checkbox.setEnabled(True)
         self.headless_checkbox.setEnabled(True)
         self.header_color_combo.setEnabled(True)
+        self.audit_mode_combo.setEnabled(True)
         self.source_mode_combo.setEnabled(True)
         self.irt_filters_frame.setEnabled(True)
         self.recipients_toggle_btn.setEnabled(True)
@@ -6090,7 +6651,9 @@ class MainWindow(QMainWindow):
 
     def extraction_finished(self, success: bool, message: str, output_path):
         """Handle extraction completion."""
+        self.progress_bar.set_indeterminate(False)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
 
         if success:
             self._set_status_state("Completed", message, "success")
@@ -6108,7 +6671,9 @@ class MainWindow(QMainWindow):
 
     def extraction_cancelled(self, message: str, output_path):
         """Handle a user-requested stop without treating it like a crash."""
+        self.progress_bar.set_indeterminate(False)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
         self._set_status_state("Stopped", message, "warning")
         self._show_info_dialog("Run stopped", message)
         self.extraction_thread = None

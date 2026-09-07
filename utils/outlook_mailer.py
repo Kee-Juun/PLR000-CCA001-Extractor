@@ -17,7 +17,7 @@ import sys
 import openpyxl
 
 
-EMAIL_SUBJECT = "RE: PLR000/CCA001 for Conversion"
+EMAIL_SUBJECT = "PLR000/CCA001 for Conversion"
 WD_AUTO_FIT_CONTENT = 1
 WD_AUTO_FIT_WINDOW = 2
 EMAIL_ADDRESS_PATTERN = re.compile(
@@ -62,6 +62,16 @@ class ExtractionEmailSummary:
         return sum(self.unavailable_counts.values())
 
 
+@dataclass(frozen=True)
+class PreAuditEmailSummary:
+    """Summary used to compose the IRT processed pre-audit email."""
+
+    intro_text: str
+    row_count: int
+    max_excel_row: int
+    document_types: set[str]
+
+
 def _log(logger: Any | None, message: str) -> None:
     """Write a log entry when a logger is available."""
     if logger:
@@ -87,9 +97,29 @@ def _document_type_from_court(court: str) -> str:
     return _clean_text(court) or "PLR000/CCA001"
 
 
+def _precheck_type_from_court(court: str) -> str:
+    """Map the COURT column to the full court code used in pre-check text."""
+    normalized = _clean_text(court).upper()
+
+    if "CCA001" in normalized:
+        return "FDCCA001"
+    if "PLR000" in normalized:
+        return "FDPLR000"
+
+    return _clean_text(court) or "FDPLR000/FDCCA001"
+
+
 def _ordered_document_types(document_types: set[str]) -> list[str]:
     """Return document types in a stable, human-friendly order."""
     preferred_order = ["PLR000", "CCA001"]
+    ordered = [doc_type for doc_type in preferred_order if doc_type in document_types]
+    ordered.extend(sorted(document_types - set(preferred_order)))
+    return ordered
+
+
+def _ordered_precheck_types(document_types: set[str]) -> list[str]:
+    """Return pre-check court labels in a stable, human-friendly order."""
+    preferred_order = ["FDPLR000", "FDCCA001"]
     ordered = [doc_type for doc_type in preferred_order if doc_type in document_types]
     ordered.extend(sorted(document_types - set(preferred_order)))
     return ordered
@@ -119,6 +149,22 @@ def _format_count_groups(counts: dict[str, int]) -> str:
         count = counts[document_type]
         noun = "document" if count == 1 else "documents"
         groups.append(f"{count} {document_type} {noun}")
+
+    if not groups:
+        return ""
+
+    if len(groups) == 1:
+        return groups[0]
+
+    return ", ".join(groups[:-1]) + f" and {groups[-1]}"
+
+
+def _format_precheck_count_groups(counts: dict[str, int]) -> str:
+    """Render grouped counts like '16 FDPLR000 and 4 FDCCA001'."""
+    groups: list[str] = []
+
+    for document_type in _ordered_precheck_types(set(counts)):
+        groups.append(f"{counts[document_type]} {document_type}")
 
     if not groups:
         return ""
@@ -212,6 +258,57 @@ def prepare_extraction_email(excel_path: Path) -> ExtractionEmailSummary:
         workbook.close()
 
 
+def prepare_preaudit_email(excel_path: Path) -> PreAuditEmailSummary:
+    """
+    Read the source workbook and build the IRT pre-audit email summary.
+
+    The pre-audit email is sent after rows are collected from IRT and before
+    Lexis Cites are checked online.
+    """
+    workbook = openpyxl.load_workbook(excel_path, data_only=True)
+
+    try:
+        worksheet = workbook.active
+        row_count = 0
+        max_excel_row = 1
+        processed_counts: Counter[str] = Counter()
+
+        for row_index in range(2, worksheet.max_row + 1):
+            row_values = [
+                worksheet[f"{column}{row_index}"].value
+                for column in ("A", "B", "C", "D")
+            ]
+
+            if not any(_clean_text(value) for value in row_values):
+                continue
+
+            row_count += 1
+            max_excel_row = row_index
+            processed_counts[
+                _precheck_type_from_court(_clean_text(worksheet[f"C{row_index}"].value))
+            ] += 1
+
+        if row_count == 0:
+            raise RuntimeError(
+                "IRT import completed, but there were no rows available for the pre-audit email."
+            )
+
+        count_groups = _format_precheck_count_groups(dict(processed_counts))
+        noun_phrase = "document was" if row_count == 1 else "documents were"
+        intro_text = (
+            f"A total of {count_groups} {noun_phrase} sent to the keying vendor:"
+        )
+
+        return PreAuditEmailSummary(
+            intro_text=intro_text,
+            row_count=row_count,
+            max_excel_row=max_excel_row,
+            document_types=set(processed_counts),
+        )
+    finally:
+        workbook.close()
+
+
 def _build_email_table_workbook(excel_path: Path, summary: ExtractionEmailSummary) -> Path:
     """
     Create a temporary workbook copy for Outlook pasting.
@@ -284,6 +381,7 @@ def _create_outlook_reply(
                 source_message_store_id or None,
             )
             reply_item = source_item.ReplyAll()
+            reply_item.Subject = EMAIL_SUBJECT
             _log(logger, "Created Outlook reply from the source email thread")
             return reply_item
         except Exception as e:
@@ -562,6 +660,137 @@ def send_extraction_email(
         if email_table_workbook_path is not None:
             try:
                 Path(email_table_workbook_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        pythoncom.CoUninitialize()
+
+
+def send_preaudit_email(
+    excel_path: Path,
+    logger: Any | None = None,
+    source_message_entry_id: str | None = None,
+    source_message_store_id: str | None = None,
+    fallback_to: str | None = None,
+    fallback_cc: str | None = None,
+    override_to: str | None = None,
+    override_cc: str | None = None,
+) -> PreAuditEmailSummary:
+    """
+    Create and send the pre-audit Outlook email using IRT-imported source rows.
+
+    The pasted table includes the source workbook columns LNI, FILENAME, COURT,
+    and DECIDED DATE only.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("Outlook automation is only supported on Windows.")
+
+    summary = prepare_preaudit_email(excel_path)
+
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as exc:
+        raise RuntimeError(
+            "pywin32 is required for Outlook automation but is not installed."
+        ) from exc
+
+    if not override_to and not any((source_message_entry_id, fallback_to, fallback_cc)):
+        raise RuntimeError(
+            "No Outlook recipient context is available for the pre-audit email send. "
+            "Provide recipients in Recipients, or make sure a PLR000/CCA001 conversion email exists in Outlook."
+        )
+
+    excel_app = None
+    workbook = None
+
+    pythoncom.CoInitialize()
+
+    try:
+        _log(logger, "Preparing Outlook pre-check email with IRT processed rows")
+
+        excel_app = win32com.client.DispatchEx("Excel.Application")
+        excel_app.Visible = False
+        excel_app.DisplayAlerts = False
+
+        workbook = excel_app.Workbooks.Open(str(excel_path), ReadOnly=True)
+        worksheet = workbook.Worksheets(1)
+
+        if worksheet.AutoFilterMode:
+            worksheet.AutoFilterMode = False
+
+        table_range = worksheet.Range(f"A1:D{summary.max_excel_row}")
+        table_range.Copy()
+
+        outlook_app = win32com.client.Dispatch("Outlook.Application")
+        mail_item = _create_outlook_reply(
+            outlook_app=outlook_app,
+            source_message_entry_id=source_message_entry_id,
+            source_message_store_id=source_message_store_id,
+            fallback_to=fallback_to,
+            fallback_cc=fallback_cc,
+            override_to=override_to,
+            override_cc=override_cc,
+            logger=logger,
+        )
+        mail_item.Display()
+
+        word_editor = mail_item.GetInspector.WordEditor
+        selection = word_editor.Application.Selection
+        _move_cursor_to_top(selection)
+        selection.TypeText("Hi All,")
+        selection.TypeParagraph()
+        selection.TypeParagraph()
+        selection.TypeText(summary.intro_text)
+        selection.TypeParagraph()
+        selection.TypeParagraph()
+        selection.Range.PasteExcelTable(False, False, False)
+        _format_pasted_outlook_table(word_editor, logger)
+
+        resolved_to, resolved_cc = _resolve_mail_recipients(
+            mail_item=mail_item,
+            override_to=override_to,
+            override_cc=override_cc,
+            fallback_to=fallback_to,
+            fallback_cc=fallback_cc,
+        )
+
+        try:
+            mail_item.Save()
+        except Exception as exc:
+            _log(logger, f"Could not save Outlook pre-check draft before send: {exc}")
+
+        mail_item.Send()
+        _log(
+            logger,
+            "Outlook pre-check email sent successfully using "
+            f"{'manual override recipients' if override_to else 'Outlook-derived recipients'}, "
+            f"To='{resolved_to}', CC='{resolved_cc}', "
+            f"with {summary.row_count} processed {'row' if summary.row_count == 1 else 'rows'}.",
+        )
+        return summary
+
+    finally:
+        if workbook is not None:
+            try:
+                if workbook.Worksheets(1).AutoFilterMode:
+                    workbook.Worksheets(1).AutoFilterMode = False
+            except Exception:
+                pass
+
+            try:
+                workbook.Close(False)
+            except Exception:
+                pass
+
+        if excel_app is not None:
+            try:
+                excel_app.CutCopyMode = False
+            except Exception:
+                pass
+
+            try:
+                excel_app.Quit()
             except Exception:
                 pass
 

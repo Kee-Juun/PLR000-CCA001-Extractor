@@ -11,6 +11,10 @@ HEADER_FILL_COLOR_KEY = "header_fill_color"
 RECIPIENT_OVERRIDE_TO_KEY = "recipient_override_to"
 RECIPIENT_OVERRIDE_CC_KEY = "recipient_override_cc"
 SOURCE_MODE_KEY = "source_mode"
+AUDIT_MODE_KEY = "audit_mode"
+RUN_REPORT_EMAIL_ENABLED_KEY = "run_report_email_enabled"
+RUN_REPORT_DEVELOPER_EMAIL_KEY = "run_report_developer_email"
+RUN_REPORT_USER_EMAIL_KEY = "run_report_user_email"
 
 
 def load_config_data() -> dict[str, Any]:
