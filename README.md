@@ -121,10 +121,52 @@ PyQt6 GUI module providing:
 
 ## Notes
 
+- Normal operation is the default. The GUI uses the same repaired extraction
+  flow validated by the diagnostic runs, writes results to the normal workbook,
+  and sends the emails selected by Check Mode using the configured recipients.
+- **Diagnostic run — no email** is an optional setting, unchecked at launch. It
+  uses that same extraction flow, disables pre-check, availability, and run-status
+  emails, and writes to a `Diagnostic_` copy of the workbook.
+- Extraction adds **EXTRACTION STATUS** and **DETAILS** columns. `Extracted`
+  requires a recognized citation and an LNI match. `No results` requires an
+  explicit negative result in Administrative Materials. `Unverified` means a
+  technical failure; `Not checked` means the row was not reached.
+- Three consecutive technical failures stop the run and preserve partial work.
+  Availability email is blocked while any row is unverified or not checked.
+  Legacy `Not Available` entries are treated as unverified, never as proof that
+  a document is stuck in keying.
+- A small browser diagnostic reads an existing workbook without modifying it or
+  sending email. It uses the saved OS-keyring login and checks at most five rows:
+
+  ```powershell
+  python diagnose_extraction.py "C:\path\results.xlsx" --rows 2,3,48
+  python diagnose_extraction.py "C:\path\results.xlsx" --rows 2,3,48 --headless
+  python diagnose_extraction.py "C:\path\results.xlsx" --unresolved --headless
+  ```
+
+  Logs, failure screenshots, UI metadata, and JSON results are written beneath
+  `outputs/diagnostics`. These files may contain document information. A failed
+  identity check remains unverified for review; the bot does not guess a citation.
+  `--unresolved` rechecks all unresolved rows into a separate `Rechecked_` workbook,
+  retains previous citations with a provenance note, and stops after three
+  consecutive technical failures. It also keeps all email disabled.
+
+Regression checks: `python -m unittest discover -s tests -v`.
+
+Build the standard executable from the project directory with:
+
+```cmd
+python -m PyInstaller --noconfirm --workpath "build\extraction-repair" "PLR-CCA Extractor.spec"
+```
+
+The output is `dist\PLR-CCA Extractor.exe`. The spec includes the icon, assets,
+Outlook/keyring dependencies, and the shared extraction modules. A failed
+pre-check or post-check email is reported as an issue even when extraction succeeds.
+
 - The bot uses XPath selectors to locate elements on the Lexis website
 - Chrome browser will be launched automatically
 - The bot waits for elements to appear before interacting with them
-- If no results are found for an LNI, "Not Available" will be written to the Excel file
+- Explicit negative results and technical failures are recorded separately
 - The browser is automatically closed after extraction completes
 
 ## Troubleshooting

@@ -106,7 +106,10 @@ class ExcelHandler:
         """
         max_row = worksheet.max_row
         
-        for col_letter in self.COLUMN_HEADERS.keys():
+        headers = dict(self.COLUMN_HEADERS)
+        if worksheet['F1'].value == 'EXTRACTION STATUS':
+            headers.update({'F': 'EXTRACTION STATUS', 'G': 'DETAILS'})
+        for col_letter in headers:
             max_length = 0
             
             # Check header
@@ -126,7 +129,9 @@ class ExcelHandler:
             # Excel column width is in character units, with a max of ~255
             column_width = min(max_length + 2, 255)
             # Set minimum width to ensure headers are visible
-            column_width = max(column_width, len(self.COLUMN_HEADERS[col_letter]) + 2)
+            column_width = max(column_width, len(headers[col_letter]) + 2)
+            if col_letter == 'G':
+                column_width = min(column_width, 70)
             worksheet.column_dimensions[col_letter].width = column_width
     
     def _apply_formatting(self, worksheet):
@@ -163,10 +168,12 @@ class ExcelHandler:
         
         # Get the data range
         max_row = worksheet.max_row
-        max_col = len(self.COLUMN_HEADERS)
+        headers = dict(self.COLUMN_HEADERS)
+        if worksheet['F1'].value == 'EXTRACTION STATUS':
+            headers.update({'F': 'EXTRACTION STATUS', 'G': 'DETAILS'})
         
         # Format headers (row 1)
-        for col_idx, col_letter in enumerate(self.COLUMN_HEADERS.keys(), 1):
+        for col_idx, col_letter in enumerate(headers, 1):
             cell = worksheet[f"{col_letter}1"]
             cell.font = header_font
             cell.alignment = center_alignment
@@ -175,10 +182,12 @@ class ExcelHandler:
         
         # Format data rows (row 2 onwards)
         for row in range(2, max_row + 1):
-            for col_letter in self.COLUMN_HEADERS.keys():
+            for col_letter in headers:
                 cell = worksheet[f"{col_letter}{row}"]
                 cell.alignment = center_alignment
                 cell.border = thin_border
+                if col_letter == 'G':
+                    cell.alignment = Alignment(vertical='center', wrap_text=True)
     
     def create_template(self, run_folder: Path = None) -> Path:
         """
@@ -308,6 +317,14 @@ class ExcelHandler:
             raise ValueError("No Excel file loaded")
         
         self.worksheet[f'E{row}'].value = lexis_cite
+
+    def write_extraction_result(self, row: int, result) -> None:
+        """Keep outcome provenance next to the original five source columns."""
+        self.write_lexis_cite(row, result.cell_value)
+        self.worksheet['F1'] = 'EXTRACTION STATUS'
+        self.worksheet['G1'] = 'DETAILS'
+        self.worksheet[f'F{row}'] = result.status
+        self.worksheet[f'G{row}'] = result.detail
     
     def save(self, output_path: Path = None):
         """

@@ -10,6 +10,9 @@ Security notes:
 from __future__ import annotations
 
 import time
+import json
+import re
+from urllib.parse import parse_qs, unquote, urlparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,9 +27,11 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from utils.extraction_result import CITE_PATTERN, EXTRACTED, NO_RESULTS, UNVERIFIED, ExtractionResult
 
 
 @dataclass(frozen=True)
@@ -50,7 +55,13 @@ class LexisScraper:
     NEXT_BUTTON = "//*[@id='signInSbmtBtn']"
 
     # Search/document selectors
-    SEARCH_TERMS_FIELD = "//*[@id='searchTerms']"
+    SEARCH_TERMS_FIELD = (
+        "//*[@id='searchTerms'] | //*[@id='searchBoxZone']//expandingtextarea"
+        " | //*[@id='searchBoxZone']//textarea | //*[@id='searchBoxZone']//input[not(@type='hidden')]"
+        " | //searchbox//expandingtextarea | //searchbox//textarea"
+        " | //*[@id='searchBoxZone']//*[@contenteditable='true']"
+        " | //input[@placeholder='Search Cases, Legislations, Secondary Materials']"
+    )
     SEARCH_BUTTON_CANDIDATES = (
         "//search-button//button",
         "//button[contains(@aria-label, 'Search')]",
@@ -70,6 +81,19 @@ class LexisScraper:
     )
     NEW_SEARCH_BUTTON = "//*[@id='searchBoxZone']//searchbox//button | //button[contains(., 'New Search')]"
     DOCUMENT_TITLE = "//*[@id='SS_DocumentTitle']"
+    RESULT_CARD = (
+        "//searchresults//*[contains(@id, 'Private Letter Ruling') "
+        "or contains(@id, 'Chief Counsel') or contains(@id, 'Technical Advice')]"
+    )
+    NO_RESULTS_MESSAGE = (
+        "//searchresults//*[self::h1 or self::h2 or self::h3 or @role='status' "
+        "or contains(@class, 'no-results') or contains(@class, 'noResults')]"
+        "[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+        "'abcdefghijklmnopqrstuvwxyz'), 'no results') "
+        "or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+        "'abcdefghijklmnopqrstuvwxyz'), 'no documents found')]"
+        "[contains(normalize-space(.), 'Administrative Materials')]"
+    )
     POST_LOGIN_TIMEOUT = 90
     POST_LOGIN_RETRY_TIMEOUT = 60
     LOGIN_REASON_SUCCESS = "success"
@@ -122,6 +146,9 @@ class LexisScraper:
         self.logger = logger
         self.wait_timeout = wait_timeout
         self.cancel_check = cancel_check
+        self.last_failure = ""
+        self._selected_lni_verified = False
+        self._requested_lni = ""
 
     def _log(self, message: str) -> None:
         """Log a message if logger is available."""
@@ -171,6 +198,9 @@ class LexisScraper:
         """
         try:
             chrome_options = Options()
+            # Lexis keeps background requests active; explicit control waits below
+            # establish readiness without waiting for every page resource.
+            chrome_options.page_load_strategy = "eager"
 
             if headless_mode:
                 # "new" headless mode is more compatible with modern Chrome.
@@ -187,6 +217,7 @@ class LexisScraper:
             chrome_options.add_experimental_option("useAutomationExtension", False)
 
             self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.set_page_load_timeout(45)
             self._log("Chrome browser launched successfully")
             return True
 
@@ -200,6 +231,17 @@ class LexisScraper:
             self._require_driver().get(self.LEXIS_URL)
             self._log("Navigated to Lexis website")
             return True
+        except TimeoutException:
+            self._log("Navigation timed out; checking whether login/search controls are usable")
+            try:
+                self._until(lambda _driver: self._visible_element(self.USERID_FIELD)
+                            or self._visible_element(self.SEARCH_TERMS_FIELD), 15)
+                return True
+            except TimeoutException:
+                self._log_page_diagnostics("Navigation timeout")
+                return False
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error navigating to Lexis: {e}")
             return False
@@ -222,7 +264,17 @@ class LexisScraper:
 
     def _find_clickable(self, xpath: str, timeout: int | None = None) -> WebElement:
         """Return a clickable element for the supplied XPath."""
-        return self._until(EC.element_to_be_clickable((By.XPATH, xpath)), timeout)
+        return self._until(lambda _driver: self._visible_element(xpath), timeout)
+
+    def _visible_element(self, xpath: str) -> WebElement | None:
+        """Skip hidden duplicate elements retained by the single-page application."""
+        for element in self._require_driver().find_elements(By.XPATH, xpath):
+            try:
+                if element.is_displayed() and element.is_enabled():
+                    return element
+            except StaleElementReferenceException:
+                continue
+        return None
 
     def _find_present(self, xpath: str, timeout: int | None = None) -> WebElement:
         """Return a present element for the supplied XPath."""
@@ -265,6 +317,8 @@ class LexisScraper:
             driver.execute_script("arguments[0].click();", element)
             self._log("Clicked element using JavaScript fallback")
             return True
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"JavaScript click fallback failed: {e}")
             return False
@@ -293,6 +347,8 @@ class LexisScraper:
                 return screenshot_path
 
             self._log("save_screenshot returned False")
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Failed to save debug screenshot: {e}")
 
@@ -321,10 +377,43 @@ class LexisScraper:
         self._log(f"{context} | Page title: {page_title}")
         self._log(f"{context} | document.readyState: {ready_state}")
 
+        # Save only relevant UI metadata; never dump login values or the full page.
+        try:
+            fields = self._require_driver().find_elements(By.XPATH, self.SEARCH_TERMS_FIELD)
+            snapshot = {
+                "context": context, "url": current_url, "title": page_title,
+                "ready_state": ready_state, "requested_lni": self._requested_lni,
+                "search_fields": [
+                    {"tag": field.tag_name, "visible": field.is_displayed(),
+                     "enabled": field.is_enabled(),
+                     "contenteditable": field.get_attribute("contenteditable")} for field in fields
+                ],
+                "new_search_buttons": len(driver.find_elements(By.XPATH, self.NEW_SEARCH_BUTTON)),
+                "window_count": len(driver.window_handles),
+                "iframe_count": len(driver.find_elements(By.TAG_NAME, "iframe")),
+                "visible_controls": [
+                    {"tag": item.tag_name, "id": item.get_attribute("id"),
+                     "role": item.get_attribute("role"), "placeholder": item.get_attribute("placeholder")}
+                    for item in driver.find_elements(By.XPATH, "//input[not(@type='password')] | //textarea | //*[@contenteditable='true']")
+                    if item.is_displayed()
+                ],
+            }
+            target = self._get_debug_artifact_folder() / (
+                "search_diagnostics_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".json"
+            )
+            target.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            self._log(f"Saved search diagnostics: {target}")
+        except InterruptedError:
+            raise
+        except Exception as error:
+            self._log(f"Could not save search diagnostics: {type(error).__name__}")
+
         for xpath in self.ADMIN_MATERIALS_BUTTON_CANDIDATES:
             try:
                 match_count = len(driver.find_elements(By.XPATH, xpath))
                 self._log(f"{context} | Administrative Materials selector matches: {match_count} | {xpath}")
+            except InterruptedError:
+                raise
             except Exception as e:
                 self._log(f"{context} | Could not count selector matches for {xpath}: {e}")
 
@@ -574,6 +663,8 @@ class LexisScraper:
                     )
                     return failure_result
 
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error during login: {e}")
             return LoginResult(
@@ -581,6 +672,27 @@ class LexisScraper:
                 reason=self.LOGIN_REASON_EXCEPTION,
                 message=f"Unexpected error during login: {e}",
             )
+
+    def prepare_search(self, force_reset: bool = False) -> bool:
+        """Require a usable input, then recover through the authenticated home page."""
+        self._raise_if_cancelled()
+        if not force_reset:
+            if self._visible_element(self.SEARCH_TERMS_FIELD):
+                return True
+            if self.click_new_search():
+                return True
+            self._log_page_diagnostics("Search navigation failure")
+        self._log("Restoring the Lexis home search page")
+        try:
+            self._require_driver().get(self.LEXIS_URL)
+            self._until(lambda _driver: self._visible_element(self.SEARCH_TERMS_FIELD), 20)
+            return True
+        except InterruptedError:
+            raise
+        except Exception as error:
+            self.last_failure = f"Search recovery failed: {type(error).__name__}"
+            self._log_page_diagnostics("Search recovery failure")
+            return False
 
     def search_lni(self, lni: str, is_first_search: bool = True) -> bool:
         """
@@ -591,28 +703,56 @@ class LexisScraper:
             is_first_search: Kept for backwards compatibility.
         """
         try:
+            if not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+", lni):
+                raise ValueError("Invalid LNI format")
             search_query = f"lni={lni}"
+            self._requested_lni = lni
+            self._selected_lni_verified = False
 
             search_field = self._until(
-                EC.visibility_of_element_located((By.XPATH, self.SEARCH_TERMS_FIELD))
+                lambda _driver: self._visible_element(self.SEARCH_TERMS_FIELD), 15
             )
             search_field.clear()
             search_field.send_keys(search_query)
+            field_text = search_field.get_attribute("value")
+            if field_text is None:
+                field_text = search_field.get_attribute("textContent") or search_field.text
+            if field_text.strip() != search_query:
+                raise RuntimeError("Search field did not retain the requested LNI")
             self._log(f"Entered search query: {search_query}")
 
-            if not self._click_first_available(self.SEARCH_BUTTON_CANDIDATES, timeout=30):
+            old_cards = [item for item in self._require_driver().find_elements(By.XPATH, self.RESULT_CARD) if item.is_displayed()]
+            # Prefer the submit button belonging to this visible search component.
+            scoped_buttons = search_field.find_elements(
+                By.XPATH, "ancestor::*[self::ln-searchbox or self::searchbox][1]//search-button//button"
+            )
+            button = next((item for item in scoped_buttons if item.is_displayed() and item.is_enabled()), None)
+            if search_field.tag_name == "input" and search_field.get_attribute("placeholder") == "Search Cases, Legislations, Secondary Materials":
+                search_field.send_keys(Keys.ENTER)
+            elif button is not None:
+                button.click()
+            elif not self._click_first_available(self.SEARCH_BUTTON_CANDIDATES, timeout=4, retries=1):
                 self._log("Search button was not found or not clickable")
+                self.last_failure = "Search submit button was not usable"
                 return False
 
             self._log("Clicked search button")
+            if old_cards:
+                self._until(lambda _driver: all(EC.staleness_of(card)(_driver) for card in old_cards), 15)
             if not self.wait_for_results_panel(timeout=45):
                 self._log("Search results panel was not ready after clicking search")
+                self.last_failure = "Search results did not become ready"
                 return False
+            self._until(lambda current: lni.lower() in current.title.lower(), 20)
 
             return True
 
+        except InterruptedError:
+            raise
         except Exception as e:
-            self._log(f"Error during search: {e}")
+            self.last_failure = f"Search failed: {type(e).__name__}"
+            self._log(f"{self.last_failure}: {e}")
+            self._log_page_diagnostics("Search failure")
             return False
 
     def click_administrative_materials(self) -> bool:
@@ -631,7 +771,7 @@ class LexisScraper:
             if not self.safe_click(
                 visible_xpath,
                 timeout=15,
-                retries=3,
+                retries=1,
                 allow_js_fallback=True,
             ):
                 self._log("Administrative Materials button not found or not clickable")
@@ -642,6 +782,8 @@ class LexisScraper:
             self._sleep_with_cancel(3)
             return True
 
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error clicking Administrative Materials: {e}")
             return False
@@ -654,16 +796,24 @@ class LexisScraper:
             Tuple of (found, element).
         """
         try:
-            result_xpath = "//*[contains(@id, 'Private Letter Ruling')]"
+            result_xpath = self.RESULT_CARD
+            if self._requested_lni:
+                result_xpath += f" | //searchresults//a[contains(@href, '{self._requested_lni}')]"
 
             self._until(
-                EC.presence_of_element_located((By.XPATH, result_xpath)),
+                lambda _driver: self._visible_element(result_xpath) or self._visible_element(self.NO_RESULTS_MESSAGE),
                 30,
             )
-            self._sleep_with_cancel(1)
 
             elements = self._require_driver().find_elements(By.XPATH, result_xpath)
 
+            elements = [element for element in elements if element.is_displayed()]
+            # Exact LNI links take precedence over title-based PLR/CCA candidates.
+            exact_links = self._require_driver().find_elements(By.XPATH, "//searchresults//a[@href]")
+            for element in exact_links:
+                if element.is_displayed() and self._requested_lni.lower() in unquote(element.get_attribute("href") or "").lower():
+                    self._selected_lni_verified = True
+                    return True, element
             if elements:
                 self._log("Result card found")
                 return True, elements[0]
@@ -674,6 +824,8 @@ class LexisScraper:
         except TimeoutException:
             self._log("No result card found within timeout")
             return False, None
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error finding result card: {e}")
             return False, None
@@ -695,6 +847,8 @@ class LexisScraper:
             self._sleep_with_cancel(3)
             return True
 
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error clicking result card: {e}")
             return False
@@ -720,6 +874,8 @@ class LexisScraper:
             self._log(f"Extracted Lexis Cite: {lexis_cite}")
             return lexis_cite
 
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error extracting Lexis Cite: {e}")
             return "Not Available"
@@ -727,17 +883,74 @@ class LexisScraper:
     def click_new_search(self) -> bool:
         """Click the New Search button to start a new search."""
         try:
-            if not self.safe_click(self.NEW_SEARCH_BUTTON, timeout=30, retries=3):
+            if not self.safe_click(self.NEW_SEARCH_BUTTON, timeout=5, retries=1):
                 self._log("New Search button not found or not clickable")
                 return False
 
             self._log("Clicked New Search button")
-            self._sleep_with_cancel(2)
+            self._until(lambda _driver: self._visible_element(self.SEARCH_TERMS_FIELD), 8)
             return True
 
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error clicking New Search: {e}")
             return False
+
+    def extract_current_lni(self, lni: str) -> ExtractionResult:
+        """Return a citation only after a fresh search and document identity check."""
+        if not self.search_lni(lni):
+            return ExtractionResult(UNVERIFIED, detail=self.last_failure)
+        if not self.click_administrative_materials():
+            return ExtractionResult(UNVERIFIED, detail="Administrative Materials could not be opened")
+        if self._visible_element(self.NO_RESULTS_MESSAGE):
+            return ExtractionResult(NO_RESULTS, detail="Administrative Materials displayed an explicit no-results message")
+        found, card = self.find_result_card()
+        if not found:
+            if self._visible_element(self.NO_RESULTS_MESSAGE):
+                return ExtractionResult(NO_RESULTS, detail="Administrative Materials displayed an explicit no-results message")
+            self._log_page_diagnostics("Result card missing")
+            return ExtractionResult(UNVERIFIED, detail="No recognized result card; absence was not confirmed")
+        driver = self._require_driver()
+        card_href = unquote(card.get_attribute("href") or "")
+        verified_link = lni.lower() in card_href.lower()
+        windows = set(driver.window_handles)
+        old_titles = [(item, item.get_attribute("textContent"))
+                      for item in driver.find_elements(By.XPATH, self.DOCUMENT_TITLE)]
+        if not self.click_result_card(card):
+            return ExtractionResult(UNVERIFIED, detail="Result card could not be opened")
+        new_windows = set(driver.window_handles) - windows
+        if len(new_windows) == 1:
+            driver.switch_to.window(new_windows.pop())
+        if old_titles:
+            self._until(lambda current: all(
+                EC.staleness_of(previous)(current) or previous.get_attribute("textContent") != text
+                for previous, text in old_titles
+            ), 20)
+        title = self._until(lambda _driver: self._visible_element(self.DOCUMENT_TITLE), 30)
+        metadata = driver.find_elements(
+            By.XPATH,
+            "//meta[@content and (@name='lni' or @name='dc.identifier' or @name='documentid')]"
+            " | //*[@id='SS_DocumentTitle']/ancestor::*[@data-lni or @data-document-lni]",
+        )
+        document_url = urlparse(unquote(driver.current_url))
+        # A search query in the URL is not evidence of the opened document's identity.
+        identity_values = [document_url.path]
+        for key, values in parse_qs(document_url.query).items():
+            if key.lower() in {"pddocfullpath", "docid", "documentid", "lni", "urn"}:
+                identity_values.extend(values)
+        for item in metadata:
+            identity_values.extend(item.get_attribute(name) or "" for name in ("content", "data-lni", "data-document-lni"))
+        verified = verified_link or self._selected_lni_verified or any(lni.lower() in value.lower() for value in identity_values)
+        if not verified:
+            self._log_page_diagnostics("Document identity unverified")
+            return ExtractionResult(UNVERIFIED, detail="Opened document could not be matched to the requested LNI")
+        match = CITE_PATTERN.search(title.text.strip())
+        if not match:
+            return ExtractionResult(UNVERIFIED, detail="Document title did not contain a recognized PLR/CCA Lexis citation")
+        cite = match.group(0)
+        self._log(f"Verified citation for LNI {lni}: {cite}")
+        return ExtractionResult(EXTRACTED, cite, "Document matched by LNI")
 
     def close_browser(self) -> None:
         """Close the browser."""
@@ -745,6 +958,8 @@ class LexisScraper:
             if self.driver:
                 self.driver.quit()
                 self._log("Browser closed")
+        except InterruptedError:
+            raise
         except Exception as e:
             self._log(f"Error closing browser: {e}")
         finally:

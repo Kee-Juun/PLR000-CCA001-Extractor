@@ -15,6 +15,7 @@ from typing import Any
 import sys
 
 import openpyxl
+from utils.extraction_result import EXTRACTED, NO_RESULTS, classify_saved_result
 
 
 EMAIL_SUBJECT = "PLR000/CCA001 for Conversion"
@@ -27,6 +28,10 @@ EMAIL_ADDRESS_PATTERN = re.compile(
 
 class NoSuccessfulExtractionsError(RuntimeError):
     """Raised when there are no successful Lexis Cite extractions to email."""
+
+
+class IncompleteExtractionError(RuntimeError):
+    """Prevent an availability email from publishing unverified rows."""
 
 
 @dataclass(frozen=True)
@@ -194,6 +199,7 @@ def prepare_extraction_email(excel_path: Path) -> ExtractionEmailSummary:
         worksheet = workbook.active
         success_rows: list[ExtractionResultRow] = []
         unavailable_counts: Counter[str] = Counter()
+        unverified_rows = []
         max_excel_row = 1
 
         for row_index in range(2, worksheet.max_row + 1):
@@ -221,10 +227,20 @@ def prepare_extraction_email(excel_path: Path) -> ExtractionEmailSummary:
                 document_type=_document_type_from_court(cleaned_court),
             )
 
-            if cleaned_cite and cleaned_cite.lower() != "not available":
+            saved_status = worksheet[f"F{row_index}"].value if worksheet['F1'].value == 'EXTRACTION STATUS' else ''
+            result_status = classify_saved_result(cleaned_cite, saved_status)
+            if result_status == EXTRACTED:
                 success_rows.append(result_row)
-            else:
+            elif result_status == NO_RESULTS:
                 unavailable_counts[result_row.document_type] += 1
+            else:
+                unverified_rows.append(row_index)
+
+        if unverified_rows:
+            raise IncompleteExtractionError(
+                f"Availability email blocked: {len(unverified_rows)} row(s) are unverified or not checked. "
+                "Review the extraction status and details in the saved workbook."
+            )
 
         if not success_rows:
             raise NoSuccessfulExtractionsError(
@@ -242,9 +258,7 @@ def prepare_extraction_email(excel_path: Path) -> ExtractionEmailSummary:
         )
 
         if unavailable_counts:
-            total_unavailable = sum(unavailable_counts.values())
-            verb = "is" if total_unavailable == 1 else "are"
-            intro_text += f", while {_format_count_groups(dict(unavailable_counts))} {verb} stuck in keying."
+            intro_text += f", while {_format_count_groups(dict(unavailable_counts))} returned no results in Lexis Administrative Materials."
         else:
             intro_text += "."
 
@@ -313,8 +327,8 @@ def _build_email_table_workbook(excel_path: Path, summary: ExtractionEmailSummar
     """
     Create a temporary workbook copy for Outlook pasting.
 
-    The copy keeps all extracted rows in the table and rewrites unavailable
-    entries in Column E as italicized "Stuck in Keying" so the receiving team
+    The copy keeps all extracted rows in the table and preserves explicit
+    extraction outcomes so the receiving team
     can follow up.
     """
     file_descriptor, temp_path_str = tempfile.mkstemp(
@@ -334,7 +348,7 @@ def _build_email_table_workbook(excel_path: Path, summary: ExtractionEmailSummar
             if _clean_text(cell.value).lower() != "not available":
                 continue
 
-            cell.value = "Stuck in Keying"
+            cell.value = "Unverified"
             italic_font = copy(cell.font)
             italic_font.italic = True
             cell.font = italic_font
@@ -629,7 +643,7 @@ def send_extraction_email(
             f"To='{resolved_to}', CC='{resolved_cc}', "
             "with the full extraction table, "
             f"including {summary.unavailable_count} follow-up "
-            f"{'item' if summary.unavailable_count == 1 else 'items'} marked as Stuck in Keying",
+            f"{'item' if summary.unavailable_count == 1 else 'items'} with confirmed no results",
         )
         return summary
 

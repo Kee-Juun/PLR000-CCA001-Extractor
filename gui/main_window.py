@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import random
+import shutil
 import traceback
 from datetime import date, timedelta
 from pathlib import Path
@@ -84,6 +85,8 @@ from config.credentials import (
     save_credentials,
 )
 from utils.bubble_audio import BubblePopAudio
+from utils.extraction_result import EXTRACTED, NO_RESULTS, UNVERIFIED, NOT_CHECKED, ExtractionResult
+from automation.extraction_flow import extract_lni
 
 
 class AnimatedProgressBar(QProgressBar):
@@ -1088,6 +1091,7 @@ class ExtractionThread(QThread):
     """Thread for running extraction process without blocking GUI."""
 
     MAX_LNI_ATTEMPTS = 2
+    MAX_CONSECUTIVE_FAILURES = 3
     progress_update = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str, object)
     cancelled = pyqtSignal(str, object)
@@ -1113,6 +1117,7 @@ class ExtractionThread(QThread):
         irt_court_scope: str = "both",
         irt_start_date: date | None = None,
         irt_end_date: date | None = None,
+        diagnostic_mode: bool = False,
     ):
         super().__init__()
         self.user_id = user_id
@@ -1121,6 +1126,7 @@ class ExtractionThread(QThread):
         self.logger = logger
         self.file_manager = file_manager
         self.headless_mode = headless_mode
+        self.diagnostic_mode = diagnostic_mode
         self.run_folder = run_folder
         self.remember_credentials = remember_credentials
         self.developer_mode_enabled = developer_mode_enabled
@@ -1180,6 +1186,9 @@ class ExtractionThread(QThread):
 
     def _send_terminal_report(self, status: str, message: str, output_path=None) -> None:
         """Send one automated status email for the current run."""
+        if self.diagnostic_mode:
+            self.logger.log("Diagnostic mode: status email suppressed")
+            return
         if self._terminal_report_sent:
             return
 
@@ -1286,88 +1295,11 @@ class ExtractionThread(QThread):
 
         self._emit_progress_update(raw_percentage, status)
 
-    def _search_current_lni(self, scraper, lni: str, is_first_search: bool) -> tuple[bool, bool]:
-        """Start or restart the search flow for the current LNI."""
-        self._raise_if_stop_requested()
-
-        if is_first_search:
-            search_ok = scraper.search_lni(lni, is_first_search=True)
-            return search_ok, False
-
-        if scraper.click_new_search():
-            return scraper.search_lni(lni, is_first_search=False), False
-
-        self.logger.log(
-            "New Search button was not available; attempting to reuse the current search field."
-        )
-        return scraper.search_lni(lni, is_first_search=False), False
-
-    def _extract_lni_with_retry(
-        self,
-        scraper,
-        lni: str,
-        is_first_search: bool,
-        processed: int,
-        total_lnis: int,
-        progress: int,
-    ) -> tuple[str, bool]:
-        """Extract one LNI, retrying once when the result stage looks transient."""
-        last_failure_detail = "result card did not appear"
-
-        for attempt in range(1, self.MAX_LNI_ATTEMPTS + 1):
-            self._raise_if_stop_requested()
-
-            if attempt > 1:
-                retry_status = (
-                    f"Retrying LNI {processed}/{total_lnis} after temporary result-load issue..."
-                )
-                self._emit_extraction_progress(progress, retry_status)
-                self.logger.log(
-                    f"Retrying LNI {lni} (attempt {attempt}/{self.MAX_LNI_ATTEMPTS}) "
-                    f"because {last_failure_detail}."
-                )
-
-            search_ok, is_first_search = self._search_current_lni(
-                scraper,
-                lni,
-                is_first_search,
-            )
-            if not search_ok:
-                last_failure_detail = "the search/results panel did not finish loading"
-                continue
-
-            if not scraper.click_administrative_materials():
-                last_failure_detail = "Administrative Materials could not be opened"
-                continue
-
-            found, result_element = scraper.find_result_card()
-            if not found:
-                last_failure_detail = "the result card did not appear in time"
-                continue
-
-            if not scraper.click_result_card(result_element):
-                last_failure_detail = "the result card could not be opened"
-                continue
-
-            lexis_cite = scraper.extract_lexis_cite()
-            if not lexis_cite or lexis_cite == "Not Available":
-                last_failure_detail = "the Lexis Cite did not finish loading"
-                continue
-
-            if attempt > 1:
-                self.logger.log(f"Retry succeeded for LNI {lni}")
-            return lexis_cite, is_first_search
-
-        self.logger.log(
-            f"LNI {lni} remained unavailable after {self.MAX_LNI_ATTEMPTS} attempt(s): "
-            f"{last_failure_detail}"
-        )
-        return "Not Available", is_first_search
-
     def run(self):
         """Run the extraction process."""
         scraper = None
         excel_handler = None
+        precheck_failure = ""
 
         try:
             from utils.excel_handler import ExcelHandler
@@ -1457,7 +1389,18 @@ class ExtractionThread(QThread):
                     )
                     return
 
-            if self.outlook_import_summary is None and not recipient_override_to:
+            if self.diagnostic_mode:
+                original_path = Path(self.excel_path)
+                diagnostic_path = original_path.with_name("Diagnostic_" + original_path.name)
+                suffix = 1
+                while diagnostic_path.exists():
+                    diagnostic_path = original_path.with_name(f"Diagnostic_{suffix}_" + original_path.name)
+                    suffix += 1
+                shutil.copy2(original_path, diagnostic_path)
+                self.excel_path = diagnostic_path
+                self.logger.log(f"Diagnostic mode: working on a copy at {diagnostic_path}")
+
+            if not self.diagnostic_mode and self.outlook_import_summary is None and not recipient_override_to:
                 try:
                     self._raise_if_stop_requested()
                     source_label = (
@@ -1480,7 +1423,7 @@ class ExtractionThread(QThread):
                         f"{source_label}: {e}"
                     )
 
-            if self.source_mode == "irt" and self.audit_mode in {"both", "pre"}:
+            if not self.diagnostic_mode and self.source_mode == "irt" and self.audit_mode in {"both", "pre"}:
                 try:
                     self._raise_if_stop_requested()
                     self._emit_precheck_progress(17, "Sending pre-check email...")
@@ -1530,6 +1473,7 @@ class ExtractionThread(QThread):
                     self.logger.log(
                         f"Error sending pre-check Outlook email: {e}\n{traceback.format_exc()}"
                     )
+                    precheck_failure = f"Pre-check email could not be sent: {e}"
                     if self.audit_mode == "pre":
                         self._emit_finished_state(
                             False,
@@ -1626,7 +1570,9 @@ class ExtractionThread(QThread):
                     self._emit_finished_state(False, user_message, None)
                     return
 
-                if self.remember_credentials:
+                if self.diagnostic_mode:
+                    self.logger.log("Diagnostic mode: saved credentials left unchanged")
+                elif self.remember_credentials:
                     password_saved = save_credentials(self.user_id, self.password)
                     if password_saved and is_keyring_available():
                         self.logger.log("Credentials saved securely using the OS keyring")
@@ -1648,7 +1594,14 @@ class ExtractionThread(QThread):
                 return
 
             processed = 0
-            is_first_search = True
+            counts = {EXTRACTED: 0, NO_RESULTS: 0, UNVERIFIED: 0, NOT_CHECKED: total_lnis}
+            row_statuses = {row: NOT_CHECKED for row, _lni in lni_data}
+            consecutive_failures = 0
+            stopped_for_failures = False
+            # Clear stale results before processing, including rows we may never reach.
+            for row, _lni in lni_data:
+                excel_handler.write_extraction_result(row, ExtractionResult(NOT_CHECKED, detail="Not yet checked in this run"))
+            excel_handler.save(self.excel_path)
 
             for row, lni in lni_data:
                 try:
@@ -1660,27 +1613,20 @@ class ExtractionThread(QThread):
                         f"Processing LNI {processed}/{total_lnis}: {lni}",
                     )
 
-                    lexis_cite, is_first_search = self._extract_lni_with_retry(
-                        scraper=scraper,
-                        lni=lni,
-                        is_first_search=is_first_search,
-                        processed=processed,
-                        total_lnis=total_lnis,
-                        progress=progress,
+                    result = extract_lni(scraper, lni, attempts=self.MAX_LNI_ATTEMPTS)
+                    excel_handler.write_extraction_result(row, result)
+                    row_statuses[row] = result.status
+                    counts = {status: list(row_statuses.values()).count(status) for status in counts}
+                    consecutive_failures = consecutive_failures + 1 if result.status == UNVERIFIED else 0
+                    self._emit_extraction_progress(
+                        progress, f"Checked {processed}/{total_lnis}: {counts[EXTRACTED]} extracted, "
+                        f"{counts[NO_RESULTS]} no results, {counts[UNVERIFIED]} unverified",
                     )
-                    excel_handler.write_lexis_cite(row, lexis_cite)
-
-                    if lexis_cite == "Not Available":
-                        self._emit_extraction_progress(
-                            progress,
-                            f"No results found for LNI {processed}/{total_lnis}",
-                        )
-                    else:
-                        lni_label = "LNI" if total_lnis == 1 else "LNIs"
-                        self._emit_extraction_progress(
-                            progress,
-                            f"Successfully extracted {processed}/{total_lnis} {lni_label}",
-                        )
+                    excel_handler.save(self.excel_path)
+                    if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                        stopped_for_failures = True
+                        self.logger.log("Stopping after 3 consecutive technical failures; remaining rows are not checked")
+                        break
 
                 except InterruptedError:
                     raise
@@ -1691,11 +1637,17 @@ class ExtractionThread(QThread):
                     )
                     self.logger.log(error_msg)
                     try:
-                        excel_handler.write_lexis_cite(row, "Not Available")
+                        excel_handler.write_extraction_result(row, ExtractionResult(UNVERIFIED, detail=f"{type(e).__name__}: {e}"))
+                        row_statuses[row] = UNVERIFIED
+                        counts = {status: list(row_statuses.values()).count(status) for status in counts}
+                        consecutive_failures += 1
                     except Exception as write_error:
                         self.logger.log(
-                            f"Failed to write 'Not Available' for row {row}: {write_error}"
+                            f"Failed to record failure for row {row}: {write_error}"
                         )
+                    if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                        stopped_for_failures = True
+                        break
                     continue
 
             try:
@@ -1712,7 +1664,23 @@ class ExtractionThread(QThread):
                 self._emit_finished_state(False, f"Failed to save output file: {e}", None)
                 return
 
-            completion_message = "Workbook saved."
+            result_summary = (
+                f"{counts[EXTRACTED]}/{total_lnis} extracted; {counts[NO_RESULTS]} confirmed no results; "
+                f"{counts[UNVERIFIED]} unverified; {counts[NOT_CHECKED]} not checked."
+            )
+            self.logger.log(result_summary)
+            if counts[UNVERIFIED] or counts[NOT_CHECKED]:
+                prefix = "Stopped after repeated technical failures. " if stopped_for_failures else "Extraction incomplete. "
+                message = prefix + result_summary + " Workbook saved; availability email suppressed."
+                if precheck_failure:
+                    message += " " + precheck_failure
+                self._emit_finished_state(False, message, output_path)
+                return
+            if self.diagnostic_mode:
+                self._emit_finished_state(True, "Diagnostic run: " + result_summary + " Workbook saved; all email disabled.", output_path)
+                return
+            completion_message = result_summary + " Workbook saved."
+            completion_success = not precheck_failure
 
             try:
                 self._raise_if_stop_requested()
@@ -1740,25 +1708,28 @@ class ExtractionThread(QThread):
                         override_cc=recipient_override_cc or None,
                     )
 
-                completion_message = (
+                completion_message = result_summary + " " + (
                     f"Email sent with {email_summary.success_count} "
                     f"available {'document' if email_summary.success_count == 1 else 'documents'}."
                 )
             except NoSuccessfulExtractionsError as e:
                 self.logger.log(str(e))
-                completion_message = str(e)
+                completion_message = result_summary + " No availability email sent because no citations were extracted."
             except InterruptedError:
                 raise
             except Exception as e:
+                completion_success = False
                 error_msg = f"Error sending Outlook email: {e}\n{traceback.format_exc()}"
                 self.logger.log(error_msg)
                 completion_message = (
-                    "Workbook saved, but the email couldn't be sent automatically.\n\n"
+                    result_summary + " Workbook saved, but the email couldn't be sent automatically.\n\n"
                     f"{e}"
                 )
 
+            if precheck_failure:
+                completion_message += " " + precheck_failure
             self._emit_finished_state(
-                True,
+                completion_success,
                 completion_message,
                 output_path,
             )
@@ -5860,6 +5831,12 @@ class MainWindow(QMainWindow):
         self.headless_checkbox = QCheckBox("Headless Mode")
         self.headless_checkbox.setToolTip("Run browser in background without showing the window")
         self.headless_checkbox.setChecked(True)
+        self.diagnostic_checkbox = QCheckBox("Diagnostic run — no email")
+        self.diagnostic_checkbox.setToolTip(
+            "Optional test run: extract to a workbook copy with all outgoing email disabled. "
+            "Leave unchecked for normal operation using the selected check mode and recipients."
+        )
+        self.diagnostic_checkbox.setChecked(False)
 
         self.header_color_combo = HeaderColorComboBox()
         self.header_color_combo.setMinimumHeight(38)
@@ -5883,6 +5860,7 @@ class MainWindow(QMainWindow):
         self.settings_popup.closed.connect(self._on_settings_popup_closed)
         self.settings_popup.add_widget(self.save_credentials_checkbox)
         self.settings_popup.add_widget(self.headless_checkbox)
+        self.settings_popup.add_widget(self.diagnostic_checkbox)
 
         settings_header_color_group = QWidget()
         settings_header_color_layout = QVBoxLayout(settings_header_color_group)
@@ -6452,7 +6430,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if self.developer_mode_enabled and not recipient_to:
+        if self.developer_mode_enabled and not recipient_to and not self.diagnostic_checkbox.isChecked():
             self._show_warning_dialog(
                 "Add a test recipient",
                 "In Developer Mode, add at least one To recipient before sending a test run.",
@@ -6508,9 +6486,11 @@ class MainWindow(QMainWindow):
         logger = Logger(file_manager)
         logger.initialize_log_file(run_folder)
         logger.log("Extraction started")
+        if self.diagnostic_checkbox.isChecked():
+            logger.log("Diagnostic mode enabled: ALL outgoing email is disabled")
         if source_mode == "manual":
             logger.log(f"Source workbook will be loaded from Template: {excel_path}")
-            if not self.developer_mode_enabled:
+            if not self.developer_mode_enabled and not self.diagnostic_checkbox.isChecked():
                 logger.log(
                     "Outlook reply context will still be resolved from the latest matching email"
                 )
@@ -6529,7 +6509,9 @@ class MainWindow(QMainWindow):
         if recipient_to:
             logger.log(
                 (
-                    "Developer mode enabled; outgoing email will use the Recipients override "
+                    "Diagnostic mode: recipients configured for normal runs; email is suppressed "
+                    if self.diagnostic_checkbox.isChecked()
+                    else "Developer mode enabled; outgoing email will use the Recipients override "
                     if self.developer_mode_enabled
                     else "Manual recipient override enabled; outgoing email will be sent "
                 )
@@ -6547,6 +6529,7 @@ class MainWindow(QMainWindow):
         self.password_input.setEnabled(False)
         self.save_credentials_checkbox.setEnabled(False)
         self.headless_checkbox.setEnabled(False)
+        self.diagnostic_checkbox.setEnabled(False)
         self.header_color_combo.setEnabled(False)
         self.audit_mode_combo.setEnabled(False)
         self.source_mode_combo.setEnabled(False)
@@ -6565,7 +6548,9 @@ class MainWindow(QMainWindow):
         self._set_status_state(
             "Syncing",
             (
-                "Opening manual workbook and starting extraction..."
+                "Diagnostic run: collecting rows and checking Lexis; all email disabled..."
+                if self.diagnostic_checkbox.isChecked()
+                else "Opening manual workbook and starting extraction..."
                 if source_mode == "manual"
                 else (
                     (
@@ -6592,6 +6577,7 @@ class MainWindow(QMainWindow):
             logger=logger,
             file_manager=file_manager,
             headless_mode=headless_mode,
+            diagnostic_mode=self.diagnostic_checkbox.isChecked(),
             run_folder=run_folder,
             remember_credentials=remember_credentials,
             developer_mode_enabled=self.developer_mode_enabled,
@@ -6633,6 +6619,7 @@ class MainWindow(QMainWindow):
         self.password_input.setEnabled(True)
         self.save_credentials_checkbox.setEnabled(True)
         self.headless_checkbox.setEnabled(True)
+        self.diagnostic_checkbox.setEnabled(True)
         self.header_color_combo.setEnabled(True)
         self.audit_mode_combo.setEnabled(True)
         self.source_mode_combo.setEnabled(True)
@@ -6662,6 +6649,8 @@ class MainWindow(QMainWindow):
         else:
             self._set_status_state("Issue", message, "error")
             self._show_error_dialog("Extraction couldn't finish", message)
+            if output_path:
+                self.open_output_file(output_path)
 
         self.extraction_thread = None
         self.reset_ui()
