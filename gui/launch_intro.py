@@ -62,6 +62,7 @@ class LaunchIntroOverlay(QWidget):
     """Transparent cinematic overlay with a real splash and ripple-style UI reveal."""
 
     finished = pyqtSignal()
+    first_frame_shown = pyqtSignal()
 
     def __init__(self, target_window: QWidget, screen=None):
         super().__init__(None)
@@ -86,6 +87,7 @@ class LaunchIntroOverlay(QWidget):
         self.motion_bottom_anchor = self.target_rect_local.bottom() + 84.0
 
         self._finished = False
+        self._first_frame_reported = False
         self._motion_frozen = False
         self._frozen_motion_frame = QImage()
         self._current_motion_frame = QImage()
@@ -571,6 +573,12 @@ class LaunchIntroOverlay(QWidget):
         self._draw_window_ripple_reveal(painter, elapsed)
 
         painter.end()
+
+        has_content = (not self._current_motion_frame.isNull()
+                       or (self._window_reveal_progress(elapsed) > 0 and not self._window_snapshot.isNull()))
+        if not self._first_frame_reported and self._timeline.isValid() and has_content:
+            self._first_frame_reported = True
+            QTimer.singleShot(0, self.first_frame_shown.emit)
 
     def mousePressEvent(self, event) -> None:
         """Allow a click to skip the intro if the user does not feel patient today."""

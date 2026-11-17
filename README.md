@@ -121,9 +121,29 @@ PyQt6 GUI module providing:
 
 ## Notes
 
+- The EXE shows a navy/cyan startup card with flowing translucent water and a large
+  percentage on the left while unpacking and loading the interface. Its native
+  Windows acrylic backdrop follows SADM Autorouter's glass treatment. The top-right
+  minimize button has rounded hover/pressed states and keeps loading in the taskbar;
+  restoring it shows current progress.
+  Finishing startup while minimized opens the main app minimized and skips the intro.
+  After a visible intro, the main workspace stays above other windows until the
+  user minimizes it or clicks outside the application. This is a one-time startup
+  state; restoring the window later does not re-enable it.
+  The estimated
+  percentage follows completed file bytes (0–55%) and real initialization milestones
+  (56–100%); it never advances just because time passes. The water stays animated
+  while the card is visible. The card closes when the main interface is ready.
+  Both build specs include the splash automatically. Source runs remain supported.
+- The startup design takes inspiration from SADM Autorouter's early loading feedback
+  and uses this project's palette and water motif. The single-file build uses
+  [PyInstaller's bootloader splash](https://pyinstaller.org/en/v6.18.0/usage.html#splash-screen-experimental)
+  to launch the small native loading window before the main application has unpacked
+  or imported Qt. If that window cannot start, a standard minimizable splash remains.
 - Normal operation is the default. The GUI uses the same repaired extraction
   flow validated by the diagnostic runs, writes results to the normal workbook,
   and sends the emails selected by Check Mode using the configured recipients.
+- Run report emails attach only the current run log and output workbook when available.
 - **Diagnostic run — no email** is an optional setting, unchecked at launch. It
   uses that same extraction flow, disables pre-check, availability, and run-status
   emails, and writes to a `Diagnostic_` copy of the workbook.
@@ -153,11 +173,30 @@ PyQt6 GUI module providing:
 
 Regression checks: `python -m unittest discover -s tests -v`.
 
+Check the fallback card with `python -m tools.verify_startup_preview`.
+Preview/check actual desktop acrylic, minimize/restore and progress while minimized with
+`python -m tools.verify_glass_startup` (it supplies its own checkerboard backdrop).
+After building, check the actual EXE startup with
+`python -m tools.verify_frozen_startup "dist\PLR-CCA Extractor.exe"`.
+Add `--stay-minimized` to check that the main window also stays minimized.
+Check the temporary main-window pin independently with `python -m tools.verify_startup_focus`.
+The latter opens and closes its own idle app instance without starting extraction.
+
 Build the standard executable from the project directory with:
 
 ```cmd
+python -m pip install -r requirements-build.txt
 python -m PyInstaller --noconfirm --workpath "build\extraction-repair" "PLR-CCA Extractor.spec"
 ```
+
+The startup artwork is generated during the build, so no manual splash-image
+export is required. The Python build installation must include Tcl/Tk (the
+standard Windows installer includes it) for the early bootloader splash.
+The specs compile and bundle the native loading window automatically using the
+Windows .NET Framework 4 compiler (`csc.exe`); no separate splash build is needed.
+Both specs isolate DLL discovery from unrelated tools on the terminal's PATH;
+Qt/numpy dependencies are collected by their package hooks. The policy version in
+the specs also invalidates dependency lists cached by older builds.
 
 The output is `dist\PLR-CCA Extractor.exe`. The spec includes the icon, assets,
 Outlook/keyring dependencies, and the shared extraction modules. A failed

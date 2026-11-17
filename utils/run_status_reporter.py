@@ -209,8 +209,6 @@ def _build_body(payload: dict[str, Any], recent_log_lines: str) -> str:
         [
             "",
             "Attached when available:",
-            "- Run Event Summary.txt",
-            "- Run Event Payload.json",
             "- Current run log",
             "- Workbook/output file",
         ]
@@ -361,8 +359,6 @@ def send_run_status_report(
     attachments = [
         path
         for path in (
-            summary_path,
-            payload_path,
             resolved_log if resolved_log and resolved_log.exists() else None,
             resolved_workbook if resolved_workbook and resolved_workbook.exists() else None,
         )
